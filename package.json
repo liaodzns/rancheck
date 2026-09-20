@@ -12,12 +12,17 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "verify:port": "node scripts/verify-port.mjs",
-    "check": "npm run typecheck && npm run verify:port && npm test"
+    "check": "npm run typecheck && npm run verify:port && npm test",
+    "build": "node scripts/build.mjs",
+    "build:watch": "node scripts/build.mjs --watch"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^20.17.0",
+    "jsdom": "^29.1.1",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.0",
+    "esbuild": "^0.24.0"
   }
 }
