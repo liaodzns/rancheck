@@ -13,7 +13,7 @@ import { copyFileSync, mkdirSync } from "node:fs";
 const watch = process.argv.includes("--watch");
 
 const options = {
-  entryPoints: { content: "src/content/index.ts" },
+  entryPoints: { content: "src/content/index.ts", worker: "src/worker/index.ts" },
   outdir: "dist",
   bundle: true,
   format: "iife",

@@ -1,15 +1,28 @@
 {
   "manifest_version": 3,
   "name": "rancheck",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Has this been run before? Counts prior deployments of the pair you are looking at on Axiom.",
   "content_scripts": [
     {
-      "matches": ["https://axiom.trade/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://axiom.trade/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
-  "host_permissions": ["https://axiomtrading-v2.axiom-cdn.io/*"],
-  "permissions": ["storage"]
+  "host_permissions": [
+    "https://axiomtrading-v2.axiom-cdn.io/*"
+  ],
+  "permissions": [
+    "storage",
+    "alarms"
+  ],
+  "background": {
+    "service_worker": "worker.js",
+    "type": "module"
+  }
 }
