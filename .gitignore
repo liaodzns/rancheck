@@ -2,3 +2,8 @@ argus/
 
 node_modules/
 dist/
+
+# Raw Axiom captures. A logged-in session dump: wallet address, balances,
+# portfolio value, hydration state. Scrub with scripts/scrub-dom-fixture.mjs
+# and commit only the result.
+fixtures/axiom-dom/axiom-pulse-*.html
