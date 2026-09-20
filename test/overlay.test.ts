@@ -59,6 +59,7 @@ const prior = (overrides: Partial<PriorRun> = {}): PriorRun => ({
   evidence: "market-cap",
   similarity: 1,
   matchedOn: ["name"],
+  imageDistance: null,
   ...overrides,
 });
 

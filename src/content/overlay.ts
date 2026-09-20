@@ -436,11 +436,28 @@ function renderPrior(doc: Document, prior: PriorRun): HTMLElement {
     // "what was recognisable", never "these fields are equal" — the port's
     // comment is explicit that matchedOn means the former.
     `recognised by ${prior.matchedOn.join(" + ")}`,
-  ].join(" · ");
+    describeImage(prior),
+  ]
+    .filter((part) => part !== null)
+    .join(" · ");
   body.appendChild(meta);
 
   row.appendChild(body);
   return row;
+}
+
+/**
+ * How close the two images are, when they were compared at all.
+ *
+ * Null when either side has no hash, and the row then says nothing about
+ * images rather than implying they differ. Perceptual hashing is approximate
+ * and the wording says so — "same image" would be a stronger claim than 10 bits
+ * out of 64 supports.
+ */
+function describeImage(prior: PriorRun): string | null {
+  if (prior.imageDistance === null) return null;
+  if (prior.imageDistance === 0) return "identical image";
+  return `image ${prior.imageDistance}/64 bits apart`;
 }
 
 function describeRun(prior: PriorRun): string {
