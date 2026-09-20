@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "rancheck",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Has this been run before? Counts prior deployments of the pair you are looking at on Axiom.",
   "content_scripts": [
     {
@@ -24,5 +24,9 @@
   "background": {
     "service_worker": "worker.js",
     "type": "module"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }

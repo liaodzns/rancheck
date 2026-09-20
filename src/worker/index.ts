@@ -19,8 +19,8 @@ import {
   runRetention,
 } from "./corpus.js";
 import { fetchAndHash, mapWithConcurrency } from "./phash.js";
-import { lookup } from "./lookup.js";
-import { corpusAge } from "./lookup.js";
+import { corpusAge, isConfident, lookup } from "./lookup.js";
+import { importLaunches } from "./import.js";
 import { THRESHOLDS } from "../shared/config.js";
 
 const corpus = new IndexedDbCorpus(THRESHOLDS);
@@ -50,7 +50,24 @@ async function handle(request: Request): Promise<Response> {
 
     case "meta": {
       const meta = await corpus.meta();
-      return { type: "meta", meta, ageMs: corpusAge(meta, Date.now()) };
+      const now = Date.now();
+      return {
+        type: "meta",
+        meta,
+        ageMs: corpusAge(meta, now),
+        // Sent rather than left for the caller to recompute, so the age gate
+        // has exactly one definition. A second copy of that rule in the options
+        // page would eventually disagree with the badge about whether the
+        // corpus is ready, and the UI would explain a state the feed is not in.
+        badgesReady: isConfident(meta, THRESHOLDS, now),
+        minAgeMs: THRESHOLDS.corpus.minAgeMsForBadge,
+      };
+    }
+
+    case "import": {
+      // The options page chunks the file; one message is one transaction.
+      const result = await importLaunches(request.launches);
+      return { type: "imported", ...result };
     }
   }
 }
