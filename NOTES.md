@@ -571,3 +571,161 @@ The recycling test was verified by mutation: with the guard commented out it
 fails, with it restored it passes. Worth doing for this one — it is the test
 standing between the product and silently attributing one coin's history to
 another.
+
+---
+
+## Phase 4 — images
+
+Goal from the spec: phash in the worker, the band index, degenerate-image
+rejection. The phase that catches the renamed clone, and the one most likely to
+cost performance — measure before and after.
+
+**Status: done.** 230 tests, `npm run check` clean, `npm run bench:phash` gives
+the cost.
+
+### Filling in argus's step 9
+
+argus declared `TokenMeta.imagePhash` and never filled it: `enrich.ts` sets it
+to `null` with the comment `// computed at step 9`, and step 9 never happened.
+This is that step.
+
+It matters more here than it would have there. Pulse exposes no metadata URI
+anywhere, so argus's cheapest true positive — two launches pointing at the same
+metadata — never fires from this surface. The image is the only remaining way
+to notice that two differently-named coins are the same thing.
+
+### The CORS trap, avoided rather than discovered
+
+Hashing in the content script is impossible and fails in a way that looks like a
+bug in your code: `drawImage` with a cross-origin `<img>` that carries no
+`crossorigin` attribute taints the canvas, and `getImageData` throws
+`SecurityError`. The taint is decided when the image was fetched, long before we
+see the element, so nothing in the page can undo it.
+
+Hashing therefore happens in the service worker — `fetch` under
+`host_permissions`, `createImageBitmap`, `OffscreenCanvas` — which is not
+subject to the page's taint rules, and where the fetch usually hits the cache
+the page already warmed.
+
+### The spec's rationale for the variance floor is wrong; the floor is right
+
+The spec says a flat image "produces a hash that matches other flat images".
+Measured, something worse happens.
+
+A solid image's DCT is entirely DC: every other coefficient is floating-point
+residue around **1e-12**. The median of those is ~0, so all 64 bits come from
+comparing numerical noise against numerical noise. Two solid grays measured **16
+bits apart** — not a collision but an *arbitrary* value, sensitive to rounding
+and therefore to the engine it ran on. That is harder to reason about than a
+predictable collision, and equally not information.
+
+So the floor stands, for a better reason than the one given, and the test that
+proves it now asserts the actual mechanism — max non-DC coefficient below 1e-9
+— rather than a collision that does not occur.
+
+### A limitation nothing in the spec anticipates: variance is not structure
+
+Visual static has **high** variance — measured at 8042 against a floor of 100 —
+and sails straight through the degenerate check. But it carries almost no
+low-frequency content, which is the only thing a DCT hash reads, so two
+unrelated noise images hashed **2 bits apart**: well inside the 10-bit match
+bar, i.e. reported as the same picture.
+
+The floor catches blank images. It does not catch featureless ones, and nothing
+currently does. This is recorded as a passing test rather than a comment, so
+that if it ever stops being true someone finds out. **If image false positives
+turn up in the wild, this is the first place to look — ahead of tightening
+`maxHamming`**, which would not address it.
+
+### Synthetic fixtures nearly produced a wrong conclusion
+
+The first draft of the tests used smooth gradients and white noise, and both
+lied:
+
+- **Gradients** made the hash look fragile. A contrast tweak measured 15 bits of
+  drift — but only because integer rounding of a smooth ramp produces staircase
+  steps whose positions move. The same tweak on a hard-edged image measures 0.
+- **Noise** made the hash look broken at telling pictures apart, for the reason
+  above.
+
+With fixtures that resemble token art — hard edges, real low-frequency structure
+— the measured behaviour is what pHash is supposed to do: brightness and
+contrast change, mild compression noise, and a one-pixel shift each move the
+hash by **0 bits**; a different picture with the same silhouette moves it 16;
+inversion moves it 62.
+
+The lesson is general enough to be worth stating: a synthetic fixture can make
+an algorithm look broken, and the failing test is then a claim about the fixture.
+
+### Cost, measured
+
+`npm run bench:phash`, on this machine:
+
+```
+  grayscale only           0.0042 ms/image   237,669 images/sec
+  DCT only                 0.0760 ms/image    13,157 images/sec
+  full hash                0.1005 ms/image     9,948 images/sec
+
+  40 visible rows:  4.0 ms of CPU total
+  31 launches/min:  0.0052% of one core, sustained
+```
+
+The separable DCT is what makes this affordable: rows-then-columns is O(2N³)
+against O(N⁴) for the direct form — 65k multiplications instead of a million at
+N=32. The CPU cost is not the constraint; fetch and decode are, which is why
+concurrency is capped at 4 and why hashing is fired and forgotten rather than
+awaited by the badge path.
+
+The benchmark reported a figure 1000× too high on its first run — it converted
+ms/second to a percentage without first dividing by 1000. Had that stood it
+would have argued for optimising something that costs nothing. Fixed, with the
+arithmetic spelled out in a comment.
+
+### Failure states are stored, not discarded
+
+`phashState` distinguishes `degenerate` from `unavailable` because they call for
+opposite behaviour. A flat picture will be flat next time, so retrying spends a
+fetch and a decode to learn the same thing; a dead link or a timeout may well
+succeed later. Collapsing them would mean either re-fetching every flat image
+forever or giving up on a CDN hiccup permanently.
+
+An unrecorded failure is indistinguishable from never having tried, so a failure
+is written to the coin just as a success is.
+
+### Matching combines two kinds of evidence
+
+Text alone must clear 0.90. Text *corroborating an image match* only has to
+clear 0.72 — argus's `vamp_of_runner.min_similarity`, the looser bar it uses
+precisely when a phash is in play. An image match alone is sufficient, which it
+has to be: a clone that renames completely is the case this phase exists for.
+
+The candidates are scored twice, at both bars, and the second pass is not
+redundant. `matchedOn` means "what was recognisable", and at 0.72 that is a
+weaker claim than at 0.90 — running one pass at the looser bar and filtering
+would make strict matches report a looser recognition than they earned. The cost
+is one extra Jaro-Winkler sweep over at most 200 candidates, which is nothing
+beside the IndexedDB reads that fetched them.
+
+Image similarity is reported as `1 - distance/64`, on the same scale as text, so
+the two sort together. At the 10-bit bar that is 0.84 — deliberately below a
+strong text match, because an identical picture is good evidence and not proof
+of identity.
+
+The popover says `image 4/64 bits apart` or `identical image`, and says nothing
+at all when either side has no hash. "Same image" would be a stronger claim than
+10 bits out of 64 supports.
+
+### Open
+
+- **`minVariance: 100` is still a guess.** `PhashResult.variance` is returned
+  specifically so it can be tuned against real token art rather than argued
+  over. Worth logging the distribution over a live session before moving it.
+- **`maxHamming: 10` is the spec's figure, unmeasured against real clones.** The
+  synthetic evidence says the bar is comfortable — identical pictures land at 0,
+  different ones at 16+ — but real re-uploads sit somewhere in between and
+  nothing here has seen one.
+- **The featureless-image hole is open.** An entropy or edge-density test on the
+  low-frequency block would close it; not built, because there is no evidence
+  yet that it bites.
+- **Nothing measures the real fetch path.** The CPU cost is known; the wall-clock
+  cost of 40 images through a capped queue on a live feed is not.
