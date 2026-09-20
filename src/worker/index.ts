@@ -11,7 +11,14 @@
  * `corpus.ts` reopens transparently when it has gone.
  */
 import type { Request, Response } from "../shared/messages.js";
-import { IndexedDbCorpus, recordObservations, runRetention } from "./corpus.js";
+import {
+  IndexedDbCorpus,
+  pendingImageWork,
+  recordObservations,
+  recordPhashes,
+  runRetention,
+} from "./corpus.js";
+import { fetchAndHash, mapWithConcurrency } from "./phash.js";
 import { lookup } from "./lookup.js";
 import { corpusAge } from "./lookup.js";
 import { THRESHOLDS } from "../shared/config.js";
@@ -22,6 +29,10 @@ async function handle(request: Request): Promise<Response> {
   switch (request.type) {
     case "observe": {
       const written = await recordObservations(request.observations);
+      // Not awaited. Hashing is network-bound and best-effort; making the
+      // content script wait on it would stall the badge behind image downloads
+      // for a number the badge can already produce without them.
+      void hashPending(written.map((coin) => coin.mint));
       return { type: "observed", recorded: written.length };
     }
 
@@ -41,6 +52,66 @@ async function handle(request: Request): Promise<Response> {
       const meta = await corpus.meta();
       return { type: "meta", meta, ageMs: corpusAge(meta, Date.now()) };
     }
+  }
+}
+
+/**
+ * Whether a hashing sweep is already running.
+ *
+ * Not corpus state — it is a lock, and losing it to a worker eviction is
+ * harmless: the worst case is one sweep running twice, which wastes a few
+ * cached fetches and writes the same verdicts again. The alternative, no lock
+ * at all, would start a fresh sweep on every 250ms pass and pile them up.
+ */
+let hashing = false;
+
+/**
+ * Hash the images of whatever was just observed.
+ *
+ * Deliberately bounded to the mints from this pass. The alternative — sweeping
+ * the whole corpus for unhashed coins — would, on a six-figure corpus, spend
+ * the worker's life re-fetching images for coins nobody is looking at, and
+ * would be doing it on every feed tick.
+ */
+async function hashPending(mints: readonly string[]): Promise<void> {
+  if (hashing) return;
+  hashing = true;
+  try {
+    const work = await pendingImageWork(mints);
+    if (work.length === 0) return;
+
+    const started = Date.now();
+    const results = await mapWithConcurrency(
+      work,
+      THRESHOLDS.phash.maxConcurrent,
+      async (item) => {
+        const result = await fetchAndHash(item.imageUrl, THRESHOLDS.phash);
+        return {
+          mint: item.mint,
+          phash: result.hash,
+          // A failure is recorded, not discarded. An unrecorded failure is
+          // indistinguishable from never having tried, and the queue would
+          // offer the same dead image again on every pass forever.
+          state: (result.hash !== null ? "ok" : result.failure) as
+            | "ok"
+            | "degenerate"
+            | "unavailable",
+        };
+      },
+    );
+
+    await recordPhashes(results);
+
+    const ok = results.filter((r) => r.state === "ok").length;
+    const flat = results.filter((r) => r.state === "degenerate").length;
+    console.log(
+      `[rancheck worker] hashed ${ok}/${results.length} images in ${Date.now() - started}ms` +
+        (flat > 0 ? ` (${flat} rejected as too flat)` : ""),
+    );
+  } catch (error) {
+    console.error("[rancheck worker] hashing failed", error);
+  } finally {
+    hashing = false;
   }
 }
 

@@ -441,3 +441,99 @@ Files:
 - `test/overlay.test.ts`
 - `NOTES.md`
 - `COMMITS.md`
+
+---
+
+## Phase 4 — images
+
+### `feat(worker): compute perceptual hashes`
+
+`src/worker/phash.ts`. 64-bit DCT pHash: 32x32 grayscale, separable 2D DCT,
+low-frequency 8x8 block, median threshold excluding DC, 16 hex characters.
+
+Fills in the field argus declared and never computed (`enrich.ts`:
+`imagePhash: null, // computed at step 9`). It matters more here than there,
+because Pulse exposes no metadata URI, so the identical-metadata shortcut never
+fires and the image is the only way to notice two differently-named coins are
+the same thing.
+
+Hashing runs in the worker, not the page: `drawImage` with a cross-origin image
+taints the canvas and `getImageData` then throws, and nothing in the content
+script can undo a taint decided when the image was fetched. Fetch,
+`createImageBitmap` and `OffscreenCanvas` in the worker avoid it entirely.
+
+The variance floor rejects flat images. The spec's stated reason — that they
+collide with each other — turns out not to be what happens: a solid image's
+non-DC coefficients are floating-point residue near 1e-12, so the hash is
+arbitrary rather than colliding. The floor stands for the better reason, and the
+comment and test now say so.
+
+Files:
+- `src/worker/phash.ts`
+- `src/shared/config.ts`
+- `test/phash.test.ts`
+
+### `feat(worker): store hash verdicts and populate the band index`
+
+`phashState` on the stored coin distinguishes `degenerate` (permanent — a flat
+picture stays flat) from `unavailable` (retryable — a dead link may not be).
+Collapsing them would mean re-fetching every flat image forever or abandoning a
+coin over one CDN hiccup.
+
+`pendingImageWork` offers only coins on screen that still need a hash;
+`recordPhashes` writes verdicts including failures, because an unrecorded
+failure is indistinguishable from never having tried. The `phashBands` index
+fills as a side effect of that write.
+
+Files:
+- `src/shared/types.ts`
+- `src/worker/corpus.ts`
+- `src/worker/ran.ts`
+- `test/corpus.test.ts`
+
+### `feat(worker): match on images as well as text`
+
+An image match alone is sufficient — the renamed clone is the case this phase
+exists for. Text alone still needs 0.90; text corroborating an image only needs
+0.72, argus's looser bar for exactly this situation.
+
+Candidates are scored at both bars rather than once at the looser one, because
+`matchedOn` means "what was recognisable" and a strict match must not report a
+looser recognition than it earned.
+
+Hashing is fired and not awaited: it is network-bound, and the badge can produce
+its number without it.
+
+Files:
+- `src/worker/lookup.ts`
+- `src/worker/index.ts`
+- `manifest.json`
+
+### `feat(content): show image evidence in the popover`
+
+`identical image` or `image 4/64 bits apart`, and nothing at all when either
+side has no hash — a failed hash is not a statement about whether two pictures
+match, and "same image" claims more than 10 bits out of 64 supports.
+
+Files:
+- `src/content/overlay.ts`
+- `test/overlay.test.ts`
+
+### `perf: measure the cost of hashing`
+
+`npm run bench:phash`. Full hash 0.10 ms/image; 40 visible rows 4.0 ms of CPU;
+31 launches/min sustained 0.0052% of one core. CPU is not the constraint, fetch
+and decode are — which is what the concurrency cap addresses.
+
+The first run reported a figure 1000x too high by converting ms/second to a
+percentage without dividing by 1000. Fixed, with the arithmetic spelled out.
+
+Files:
+- `scripts/bench-phash.ts`
+- `package.json`
+
+### `docs: record phase 4 implementation notes`
+
+Files:
+- `NOTES.md`
+- `COMMITS.md`

@@ -142,8 +142,19 @@ export interface StoredCoin {
   /** Character trigrams of both normalised forms. The fuzzy-lookup index. */
   trigrams: string[];
   imageUrl: string | null;
-  /** Perceptual hash, 16 hex characters. Null until phase 4 has fetched it. */
+  /** Perceptual hash, 16 hex characters. Null until the image has been hashed. */
   phash: string | null;
+  /**
+   * What happened when the image was last hashed.
+   *
+   * `null` means never attempted. The two failures are kept apart because they
+   * call for opposite behaviour: `degenerate` is a property of the picture and
+   * will never change, so retrying costs a fetch and a decode to learn nothing,
+   * while `unavailable` is a dead link or a timeout and may well succeed later.
+   * Collapsing them would mean either re-fetching every flat image forever or
+   * giving up on a CDN hiccup permanently.
+   */
+  phashState: "ok" | "degenerate" | "unavailable" | null;
   firstSeen: Timestamp;
   lastSeen: Timestamp;
   peakMcUsd: number | null;

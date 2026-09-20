@@ -327,6 +327,78 @@ async function keysOfIndex(
 }
 
 /**
+ * Coins that still need their image hashed.
+ *
+ * Only ever those with an image URL and no verdict yet. A coin already marked
+ * `degenerate` is never handed back — that is a property of the picture and
+ * cannot change, so retrying would spend a fetch and a decode to learn the same
+ * thing. An `unavailable` coin is retried, because a dead link or a timeout may
+ * not be permanent, but only after `retryAfterMs` so one broken CDN cannot
+ * occupy the queue.
+ *
+ * Scoped to `mints` rather than scanning the store, because the only coins
+ * worth hashing are the ones currently on screen, and a full scan on a corpus
+ * of six figures is not something to do on a feed tick.
+ */
+export async function pendingImageWork(
+  mints: readonly string[],
+  now: Timestamp = Date.now(),
+  retryAfterMs = 6 * 60 * 60 * 1000,
+): Promise<Array<{ mint: string; imageUrl: string }>> {
+  if (mints.length === 0) return [];
+
+  return withDb(async (db) => {
+    const coins = db.transaction(COINS, "readonly").objectStore(COINS);
+    const work: Array<{ mint: string; imageUrl: string }> = [];
+
+    for (const mint of mints) {
+      const coin = fromRecord((await promisify(coins.get(mint))) as CoinRecord | undefined);
+      if (coin === null || coin.imageUrl === null) continue;
+      if (coin.phash !== null || coin.phashState === "degenerate") continue;
+      if (coin.phashState === "unavailable" && now - coin.lastSeen < retryAfterMs) continue;
+      work.push({ mint, imageUrl: coin.imageUrl });
+    }
+
+    return work;
+  });
+}
+
+/**
+ * Store the outcome of hashing a coin's image.
+ *
+ * Writes the verdict even when it is a failure, which is the point: an
+ * unrecorded failure is indistinguishable from never having tried, and the
+ * queue would offer the same dead image on every pass forever.
+ *
+ * `phashBands` is recomputed by `toRecord`, so the band index becomes populated
+ * as a side effect of this write and needs no separate maintenance.
+ */
+export async function recordPhashes(
+  results: ReadonlyArray<{ mint: string; phash: string | null; state: StoredCoin["phashState"] }>,
+): Promise<number> {
+  if (results.length === 0) return 0;
+
+  return withDb(async (db) => {
+    const tx = db.transaction(COINS, "readwrite");
+    const coins = tx.objectStore(COINS);
+    let written = 0;
+
+    for (const result of results) {
+      const coin = fromRecord((await promisify(coins.get(result.mint))) as CoinRecord | undefined);
+      // The coin may have been evicted by retention between the queue being
+      // built and the hash coming back. Re-creating it here from nothing but a
+      // hash would put a coin in the corpus that was never observed.
+      if (coin === null) continue;
+      coins.put(toRecord({ ...coin, phash: result.phash, phashState: result.state }));
+      written += 1;
+    }
+
+    await done(tx);
+    return written;
+  });
+}
+
+/**
  * Drop coins that never ran and have not been seen for a while.
  *
  * A coin that ran is never evicted regardless of age — it is the entire point

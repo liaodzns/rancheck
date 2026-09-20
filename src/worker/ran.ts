@@ -109,6 +109,7 @@ export function mergeSighting(
       trigrams: normalised.trigrams,
       imageUrl: observation.imageUrl,
       phash: null,
+      phashState: null,
       firstSeen: observation.seenAt,
       lastSeen: observation.seenAt,
       peakMcUsd: observation.marketCapUsd,
