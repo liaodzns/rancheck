@@ -16,6 +16,7 @@ import {
 } from "../src/worker/corpus.js";
 import { lookup } from "../src/worker/lookup.js";
 import { mergeCandidates, normaliseText, phashBands, trigramsOf } from "../src/worker/index-store.js";
+import { recordPhashes, pendingImageWork } from "../src/worker/corpus.js";
 import { THRESHOLDS } from "../src/shared/config.js";
 import type { PairObservation } from "../src/shared/types.js";
 
@@ -377,5 +378,165 @@ describe("index helpers", () => {
     const capped = mergeCandidates([["a", "b", "c"]], { max: 2 });
     expect(capped.capped).toBe(true);
     expect(capped.mints).toHaveLength(2);
+  });
+});
+
+
+describe("image matching end to end", () => {
+  const MATURE = T0 + 10 * DAY;
+  const AGE_GATE_OK = { ...THRESHOLDS, corpus: { ...THRESHOLDS.corpus, minAgeMsForBadge: 3 * DAY } };
+
+  /** Two hashes 4 bits apart — inside the 10-bit bar. */
+  const HASH_A = "0f0f0f0f0f0f0f0f";
+  const HASH_NEAR = "0f0f0f0f0f0f0f00";
+  /** Far outside it. */
+  const HASH_FAR = "f0f0f0f0f0f0f0f0";
+
+  it("finds a clone that renamed completely", async () => {
+    // The case phase 4 exists for, and the one both text indexes are blind to
+    // by construction: same picture, no shared text at all.
+    await recordObservations(
+      [observe({ mint: mint(1), name: "Thursday Arena", symbol: "THURSDAY" })],
+      THRESHOLDS,
+      T0,
+    );
+    await recordPhashes([{ mint: mint(1), phash: HASH_A, state: "ok" }]);
+
+    await recordObservations(
+      [observe({ mint: mint(2), name: "Completely Unrelated", symbol: "ZZZZ" })],
+      THRESHOLDS,
+      T0,
+    );
+    await recordPhashes([{ mint: mint(2), phash: HASH_NEAR, state: "ok" }]);
+
+    const result = await lookup(
+      { mint: mint(2), name: "Completely Unrelated", symbol: "ZZZZ" },
+      new IndexedDbCorpus(),
+      AGE_GATE_OK,
+      MATURE,
+    );
+
+    expect(result.totalCount).toBe(1);
+    expect(result.priors[0]!.mint).toBe(mint(1));
+    expect(result.priors[0]!.matchedOn).toContain("image");
+    expect(result.priors[0]!.imageDistance).toBe(4);
+  });
+
+  it("does not match on a distant image", async () => {
+    await recordObservations(
+      [observe({ mint: mint(1), name: "Thursday Arena", symbol: "THURSDAY" })],
+      THRESHOLDS,
+      T0,
+    );
+    await recordPhashes([{ mint: mint(1), phash: HASH_A, state: "ok" }]);
+    await recordObservations(
+      [observe({ mint: mint(2), name: "Completely Unrelated", symbol: "ZZZZ" })],
+      THRESHOLDS,
+      T0,
+    );
+    await recordPhashes([{ mint: mint(2), phash: HASH_FAR, state: "ok" }]);
+
+    const result = await lookup(
+      { mint: mint(2), name: "Completely Unrelated", symbol: "ZZZZ" },
+      new IndexedDbCorpus(),
+      AGE_GATE_OK,
+      MATURE,
+    );
+    expect(result.totalCount).toBe(0);
+  });
+
+  it("reports both image and text when both agree", async () => {
+    await recordObservations(
+      [observe({ mint: mint(1), name: "Thursday Arena", symbol: "THURSDAY" })],
+      THRESHOLDS,
+      T0,
+    );
+    await recordPhashes([{ mint: mint(1), phash: HASH_A, state: "ok" }]);
+    await recordObservations([observe({ mint: mint(2) })], THRESHOLDS, T0);
+    await recordPhashes([{ mint: mint(2), phash: HASH_NEAR, state: "ok" }]);
+
+    const result = await lookup(
+      { mint: mint(2), name: "Thursday Arena", symbol: "THURSDAY" },
+      new IndexedDbCorpus(),
+      AGE_GATE_OK,
+      MATURE,
+    );
+    expect(result.priors[0]!.matchedOn).toContain("name");
+    expect(result.priors[0]!.matchedOn).toContain("image");
+  });
+
+  it("treats a missing hash as unknown, never as a mismatch", async () => {
+    // A coin whose image could not be fetched must still match on its text.
+    await recordObservations([observe({ mint: mint(1) })], THRESHOLDS, T0);
+    await recordPhashes([{ mint: mint(1), phash: null, state: "unavailable" }]);
+    await recordObservations([observe({ mint: mint(2) })], THRESHOLDS, T0);
+
+    const result = await lookup(
+      { mint: mint(2), name: "Thursday Arena", symbol: "THURSDAY" },
+      new IndexedDbCorpus(),
+      AGE_GATE_OK,
+      MATURE,
+    );
+    expect(result.totalCount).toBe(1);
+    expect(result.priors[0]!.imageDistance).toBeNull();
+    expect(result.priors[0]!.matchedOn).not.toContain("image");
+  });
+});
+
+describe("image work queue", () => {
+  it("offers a coin that has an image and no verdict", async () => {
+    await recordObservations(
+      [observe({ imageUrl: "https://cdn.example/a.webp" })],
+      THRESHOLDS,
+      T0,
+    );
+    const work = await pendingImageWork([mint(1)], T0);
+    expect(work).toEqual([{ mint: mint(1), imageUrl: "https://cdn.example/a.webp" }]);
+  });
+
+  it("never offers a coin again once hashed", async () => {
+    await recordObservations(
+      [observe({ imageUrl: "https://cdn.example/a.webp" })],
+      THRESHOLDS,
+      T0,
+    );
+    await recordPhashes([{ mint: mint(1), phash: "0f0f0f0f0f0f0f0f", state: "ok" }]);
+    expect(await pendingImageWork([mint(1)], T0)).toEqual([]);
+  });
+
+  it("never retries a degenerate image", async () => {
+    // A flat picture will be flat next time too. Retrying spends a fetch and a
+    // decode to learn the same thing.
+    await recordObservations(
+      [observe({ imageUrl: "https://cdn.example/flat.webp" })],
+      THRESHOLDS,
+      T0,
+    );
+    await recordPhashes([{ mint: mint(1), phash: null, state: "degenerate" }]);
+    expect(await pendingImageWork([mint(1)], T0 + 365 * DAY)).toEqual([]);
+  });
+
+  it("retries an unavailable image, but only after a delay", async () => {
+    // A dead link or a timeout may not be permanent. One broken CDN must not
+    // occupy the queue every pass in the meantime.
+    await recordObservations(
+      [observe({ imageUrl: "https://cdn.example/gone.webp" })],
+      THRESHOLDS,
+      T0,
+    );
+    await recordPhashes([{ mint: mint(1), phash: null, state: "unavailable" }]);
+    expect(await pendingImageWork([mint(1)], T0)).toEqual([]);
+    expect(await pendingImageWork([mint(1)], T0 + 7 * 60 * 60 * 1000)).toHaveLength(1);
+  });
+
+  it("skips a coin with no image at all", async () => {
+    await recordObservations([observe({ imageUrl: null })], THRESHOLDS, T0);
+    expect(await pendingImageWork([mint(1)], T0)).toEqual([]);
+  });
+
+  it("does not resurrect a coin evicted between queueing and hashing", async () => {
+    // Writing a hash for a coin that is no longer stored would put a coin in
+    // the corpus that was never observed.
+    expect(await recordPhashes([{ mint: mint(99), phash: "0f0f0f0f0f0f0f0f", state: "ok" }])).toBe(0);
   });
 });
