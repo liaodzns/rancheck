@@ -14,7 +14,8 @@
     "verify:port": "node scripts/verify-port.mjs",
     "check": "npm run typecheck && npm run verify:port && npm test",
     "build": "node scripts/build.mjs",
-    "build:watch": "node scripts/build.mjs --watch"
+    "build:watch": "node scripts/build.mjs --watch",
+    "bench:phash": "vite-node scripts/bench-phash.ts"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",
