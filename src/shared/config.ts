@@ -32,6 +32,22 @@ export interface CorpusThresholds {
   trigramMinLength: number;
 }
 
+export interface PhashThresholds {
+  /** Edge length the image is reduced to before the DCT. */
+  sampleSize: number;
+  /** Edge length of the low-frequency block the hash is built from. */
+  dctSize: number;
+  /** Hamming distance at or below which two images count as the same picture. */
+  maxHamming: number;
+  /** Grayscale variance below which an image is too flat to hash. */
+  minVariance: number;
+  /** Image fetches in flight at once. */
+  maxConcurrent: number;
+  /** Largest image worth decoding. */
+  maxBytes: number;
+  fetchTimeoutMs: number;
+}
+
 export interface CandidateThresholds {
   /** Most candidates scored for one row before the list is truncated. */
   maxPerRow: number;
@@ -43,6 +59,7 @@ export interface Thresholds {
   ran: RanThresholds;
   corpus: CorpusThresholds;
   candidates: CandidateThresholds;
+  phash: PhashThresholds;
 }
 
 export const THRESHOLDS: Thresholds = {
@@ -108,6 +125,33 @@ export const THRESHOLDS: Thresholds = {
     // with more than 200 plausible prior deployments is itself the answer to
     // the question being asked.
     maxPerRow: 200,
+  },
+
+  phash: {
+    // The standard DCT pHash geometry: 32x32 grayscale, low-frequency 8x8
+    // block, 64 bits, 16 hex characters.
+    sampleSize: 32,
+    dctSize: 8,
+    // The spec's figure, and a starting point rather than a measured one. Out
+    // of 64 bits, 10 is generous — it is meant to survive recompression and a
+    // watermark, not to be tight. Tighten toward 6 if flat images produce false
+    // positives; the variance floor below should make that unnecessary, and if
+    // it does not, that floor is the thing that is wrong.
+    maxHamming: 10,
+    // A GUESS, and the one most worth checking against real data. Real token
+    // art — cartoons, photos, logos — lands in the thousands. A solid colour is
+    // 0. The risk is a legitimately minimal logo, a dark square with small
+    // text, which can sit in the low hundreds; 100 is chosen to clear that
+    // while still rejecting anything genuinely uniform. PhashResult carries the
+    // measured variance precisely so this can be tuned rather than argued over.
+    minVariance: 100,
+    // The spec's 4-6. Forty visible rows would otherwise open forty concurrent
+    // fetches against a page that is already streaming a feed.
+    maxConcurrent: 4,
+    // Token art is tens of kilobytes. Two megabytes is far past anything
+    // legitimate and well short of what would evict the worker mid-decode.
+    maxBytes: 2_000_000,
+    fetchTimeoutMs: 8_000,
   },
 };
 
