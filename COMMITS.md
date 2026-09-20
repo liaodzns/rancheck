@@ -537,3 +537,87 @@ Files:
 Files:
 - `NOTES.md`
 - `COMMITS.md`
+
+---
+
+## Phase 5 — seeding
+
+### `feat(worker): import a recording into the corpus`
+
+`src/worker/import.ts`. Validation plus a batched write, and the project's only
+edge against genuinely untrusted data — a file the user picked, from a recorder
+that may be any version or none. Hand-rolled rather than zod, which is the trade
+the type contract already describes.
+
+Permissive about everything except the mint: a blank name is a real launch and
+the matcher's `minLength` guard already handles it. Duplicates within one file
+are dropped, because a recording repeats frames after a reconnect.
+
+`lastSeen` is set to the import moment, not the recorded launch time. Retention
+drops never-ran coins by `lastSeen` and every imported coin is never-ran, so the
+launch time would have had the whole seed deleted by the first sweep minutes
+after import. `firstSeen` keeps the real launch date for display.
+
+Seeded coins can never count as having run — the feed carries no market cap and
+no migration — so an import grows the total and never the ran count. Asserted
+end to end.
+
+Files:
+- `src/worker/import.ts`
+- `src/worker/corpus.ts` (extracts `withCoinsWrite`, shared with the observe path)
+- `src/shared/types.ts` (adds the `imported` source)
+- `test/import.test.ts`
+
+### `feat(scripts): record launches from PumpPortal`
+
+`scripts/record-launches.ts`, `npm run record`. A port of argus's launch stream
+and the parts of `reconnect.ts` it needs, reduced to what a recorder wants: no
+Redis, no pino, no event bus, no zod.
+
+The silence watchdog is the reason it is a port rather than twenty lines of
+WebSocket. At ~31 launches a minute, silence means the socket died, not that
+nobody launched — and a recorder without one looks healthy while writing
+nothing. Verified against two throwaway servers: one that kills the socket
+mid-stream, and one that connects and then stays mute.
+
+Writes newline-delimited JSON. A run measured in days will be killed, and a
+truncated JSON array parses as nothing.
+
+Files:
+- `scripts/record-launches.ts`
+- `package.json` (adds `record`, `ws`)
+
+### `feat(options): add an options page for seeding and corpus status`
+
+The first UI beyond the badge, and unavoidable: a content script cannot open a
+file picker and the worker has no DOM.
+
+Shows coin count, corpus age, and whether badges are live — the last of which
+distinguishes "the age gate is holding numbers back" from "nothing is being
+stored", which need opposite responses. `badgesReady` comes from the worker so
+the age gate has one definition rather than two that can drift apart.
+
+Imports chunk at 2,000 launches per message: `sendMessage` serialises the whole
+payload, and each batch is one IndexedDB transaction.
+
+Files:
+- `src/options/index.html`
+- `src/options/index.ts`
+- `src/shared/messages.ts`
+- `src/worker/index.ts`
+- `manifest.json`
+
+### `build: emit IIFE for the content script and ESM for the rest`
+
+The worker is `"type": "module"` and the options page loads as a module, but MV3
+injects a content script as a classic script, where an ESM bundle fails at load
+with an error that points at the file rather than the format.
+
+Files:
+- `scripts/build.mjs`
+
+### `docs: record phase 5 implementation notes`
+
+Files:
+- `NOTES.md`
+- `COMMITS.md`

@@ -729,3 +729,150 @@ at all when either side has no hash. "Same image" would be a stronger claim than
   yet that it bites.
 - **Nothing measures the real fetch path.** The CPU cost is known; the wall-clock
   cost of 40 images through a capped queue on a live feed is not.
+
+---
+
+## Phase 5 — seeding
+
+Goal from the spec: a JSON importer, and a small recorder against PumpPortal's
+free `subscribeNewToken` feed — lifting `packages/ingest/src/streams/launches.ts`
+and keeping its silence watchdog. Cold start goes from weeks to hours.
+
+**Status: done.** 255 tests, `npm run check` clean, all three bundles build.
+
+### What seeding fixes, and the half it cannot
+
+The launch feed carries a mint, a name, a ticker and a metadata URI. It carries
+**no market cap and no migration**, so every imported coin arrives with
+`ran: false` and stays that way unless you later watch it run yourself.
+
+So a seed grows the **denominator** and never the numerator. A ticker reading
+`3 / 12` before an import reads `3 / 47` after — nothing got worse, you simply
+now know about 35 deployments you had never seen. There is an end-to-end test
+asserting exactly this, because it is the kind of behaviour that looks like a
+regression to anyone who has not read why.
+
+It also means **phase 5 does not touch the 3am blind spot at all.** That gap is
+the numerator's, and seeding is good at precisely what the local corpus was
+already good at. The same asymmetry came up when DexScreener was considered as a
+source and it points the same way.
+
+### The retention trap, found by reasoning rather than by losing a seed
+
+Retention drops never-ran coins `retentionMs` after `lastSeen`. Every imported
+coin is never-ran. So if an import wrote `lastSeen` as the recorded launch time,
+importing a two-month-old recording would have the entire seed deleted by the
+first retention sweep, minutes after it landed — silently, and with the coin
+count dropping back to nothing.
+
+The fix is a semantic one rather than a special case: **`lastSeen` means when a
+coin last entered our hands**, and importing a file today *is* having those
+coins in hand today. So an import sets `lastSeen` to the import moment while
+`firstSeen` keeps the real launch time, which is what the popover displays.
+`mergeSighting` could not do this itself — an observation carries one timestamp,
+and for an import "when it arrived" and "when it launched" are two different
+facts — so `importLaunches` restores `firstSeen` after the merge, in two
+documented lines.
+
+Both halves are tested: a sixty-day-old seed survives retention, and its
+`firstSeen` is still the launch date.
+
+### The metadata URI comes back
+
+Pulse exposes no metadata URI anywhere — phase 2 measured that at 0% — so
+argus's cheapest true positive, an identical `uri` short-circuiting to
+similarity 1, has been dead on this surface since the beginning. The launch feed
+carries one on every row, so imported coins restore it for seed-to-seed
+comparisons. That is a real gain and it arrived for free.
+
+### The silence watchdog is the reason this is a port
+
+argus's own header says it best, and the failure is silent by construction: **a
+stream that stops delivering looks exactly like a quiet market.** At ~31
+launches a minute, silence means the socket died. A recorder without a watchdog
+sits open and healthy-looking for six hours, writes nothing, and you find out
+when the file you go to import is twelve rows long.
+
+Ported along with the jittered backoff, and verified rather than assumed. Two
+throwaway servers were used:
+
+- One that serves frames, then kills the socket. The recorder wrote 2 valid
+  launches, dropped 4 duplicates and 2 malformed rows, reconnected, and carried
+  on.
+- One that accepts the connection and then says nothing. The recorder reported
+  `no frames for 1200ms; the feed is dead, not quiet`, tore the connection down,
+  and reconnected twice with growing backoff.
+
+Worth having run. A watchdog that does not fire is indistinguishable from one
+that works until the day it matters.
+
+### Output is newline-delimited, not an array
+
+A run measured in days will be killed, and a truncated JSON array parses as
+nothing at all — the whole recording lost to one missing bracket. NDJSON appends
+without holding the file in memory and leaves a complete, importable file behind
+at any moment.
+
+`parseLaunchFile` accepts both, so the importer does not care which produced the
+file, and the committed 123-launch argus fixture works as a seed unchanged —
+which is also a real end-to-end test of the importer needing no recorder run.
+There is a test for the truncated final line specifically.
+
+### An options page, because a file has to come from somewhere
+
+The first UI in the project beyond the badge. A content script cannot open a
+file picker for a local file and the worker has no DOM, so there was no way
+around it.
+
+It shows coin count, corpus age, and whether badges are live — and that third
+one earns its place: a user seeing "new corpus" on every badge needs to know
+whether the age gate is holding numbers back or the extension is failing to
+store anything, and those call for opposite responses. `badgesReady` is sent by
+the worker rather than recomputed in the page, so the age gate keeps exactly one
+definition; a second copy would eventually disagree with the badge and the UI
+would be explaining a state the feed was not in.
+
+Imports are chunked at 2,000 launches per message. Two limits meet there:
+`sendMessage` serialises the whole payload, and each batch is one IndexedDB
+transaction that holds the store for its duration. A failed batch stops the run
+and says which row it stopped at, rather than throwing — everything before that
+point is genuinely in the corpus and saying so is more useful than implying it
+all failed.
+
+### Build now emits two formats
+
+The worker is `"type": "module"` and the options page loads as a module, but a
+content script is neither — MV3 injects it as a classic script, and an ESM
+bundle there fails at load with an error pointing at the file rather than the
+format. `scripts/build.mjs` builds content as IIFE and the other two as ESM.
+Caught before shipping only because the output was checked; it would have been a
+confusing first symptom.
+
+### A test-fixture bug, for the second time in this project
+
+The end-to-end seeding test generated mints with `String(n).padStart(3, "A")`,
+which yields `"A10"` at ten — and **`0` is not in the base58 alphabet**. The
+importer correctly rejected three of thirty and the test failed at 28. The
+importer was right; the fixture was not.
+
+This is the same shape as the phase-3 `padStart(2, "1")` collision. Both times a
+generator produced invalid or duplicate mints and the production code was
+blamed first. The test now asserts its own fixture is valid before asserting
+anything about the result, and there is a spelled-out base58 alphabet with a
+comment saying why decimal digits do not work.
+
+### Open
+
+- **Nothing has been recorded for real yet.** The recorder is verified against
+  two synthetic feeds; it has not been pointed at PumpPortal for an hour, and
+  the ~31/min figure is argus's, not a measurement of ours.
+- **Storage at seed scale is unmeasured.** 45k launches/day means a week is
+  ~315k coins. The spec budgeted 100k at ~20MB; with the trigram index this is
+  likely several times that. Worth measuring after the first real import rather
+  than guessing now — the options page's coin count is the place to watch it.
+- **Import is all-or-nothing per batch and has no resume.** A 300k-row file that
+  fails at row 200,000 leaves 200,000 coins imported and no record of where to
+  restart. Re-importing is safe — mints merge — so the cost is time, not
+  correctness.
+- **No image hashes on seeded coins.** The feed carries no image, so phase 4's
+  matching does not apply to them. Text-only, which is ~98% of matches anyway.
