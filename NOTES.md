@@ -167,3 +167,132 @@ carries a `.env`.
   merge its own result with the text result rather than route through
   `matchNarrative`, which knows nothing about images — another reason the wrapper
   is where adaptation belongs.
+
+---
+
+## Phase 2 — the scraper, read-only
+
+Goal from the spec: a content script that logs `PairObservation[]` and ships no
+UI, DOM snapshots committed as fixtures, and scraper tests written against them.
+Judged on per-field extraction rate across a few hundred rows.
+
+**Status: done.** 115 tests, `npm run check` clean, `npm run build` produces a
+loadable unpacked extension.
+
+### The spec's first scraper rule is wrong, and it fails silently
+
+The spec says to anchor on the mint: find `a[href*="/meme/"]`, parse the mint
+out of the href, walk up to the row. Measured against the capture, that does not
+work — and it fails in the most expensive way available, which is that it
+appears to work.
+
+The captured Pulse page holds 15 `/meme/` anchors. **Every one is in the price
+ticker strip along the top.** The three columns hold 30 cards between them and
+contain no anchors at all; they are divs with click handlers, which is what a
+React app usually does. A scraper built on the spec's rule returns 15
+plausible-looking rows scraped from a ticker, and the corpus quietly fills with
+coins that were never on the feed.
+
+What the cards carry instead is `data-pulse-token-address`, holding the full
+mint. The spec's *reasoning* is what makes that trustworthy and it transfers
+intact: it is application instrumentation rather than styling, it is the
+identity Axiom's own code keys on, and it cannot drift without breaking the
+page. The hashed Tailwind classes around it change every deploy; this does not.
+
+The mint turns out to be attested four independent ways on every card — the
+attribute, the CDN image filename, a `pump.fun/coin/<mint>` link and an
+`x.com/search?q=<mint>` link — so `mintOf()` falls through them in order rather
+than trusting any one. There is a test that strips the attribute and confirms
+the image filename alone still resolves the right mint.
+
+`test/scrape.test.ts` has a test asserting the ticker strip yields zero cards.
+That is the test that would have caught this, so it is worth keeping pointed at.
+
+### Three traps in the real markup
+
+**The subscript fee.** Axiom renders fees as `0.0<sub>5</sub>4`. Flattened by
+`textContent` that is `"0.054"` — an entirely believable number, wrong by five
+orders of magnitude. The scraper therefore tokenises per text node rather than
+reading `textContent`, so such a value can never reassemble into a plausible
+one, and `valueAfterLabel` additionally refuses any value whose subtree contains
+a `<sub>`. We do not store fees, but the same notation could appear in a price
+column tomorrow, and the failure would be invisible.
+
+**The second image.** The Boring Company, in Migrated, renders a WBTC icon
+alongside its own token image. "The first `<img>`" and "the first CDN `<img>`"
+both pick wrong. Images are selected by filename matching the mint, which is
+self-validating and is the same fact that makes the image a mint fallback. In
+phase 4 this would have become the wrong perceptual hash on a coin — a false
+"has run before" that no amount of threshold tuning would fix.
+
+**The countdown.** The same card renders `4m` and then `0:31`. Age is found by
+scanning forward from its expected slot for a duration-shaped token rather than
+taking a fixed index. A card with no name also renders its age where the name
+would go, so there is a guard for that too: storing a coin named `4m` and losing
+the age is worse than storing a null name.
+
+### Extraction rate
+
+100% on every tracked field across all 30 cards: name, symbol, imageUrl,
+marketCapUsd, volumeUsd, ageSeconds. Asserted exactly rather than as a floor —
+this is the metric the spec says to judge the phase on, and drift in it is the
+earliest warning available.
+
+`metadataUri` is 0% and that is not a failure: Pulse does not expose one
+anywhere. The consequence is real though — **the identical-URI shortcut from
+argus, the cheapest true positive in the matcher, never fires from this
+surface.** The image URL is the usable proxy the spec suggests, and phase 4 is
+where it starts paying. `diagnose()` deliberately excludes `metadataUri` from
+the redesign check, because a field that has always been 0% is not a regression
+and warning about it every pass would train the warning to be ignored.
+
+### The same coin in two columns
+
+A pair in Final Stretch also sits in New Pairs, with identical numbers, and both
+are scraped in the same pass. `dedupeByMint` collapses them, keeping the most
+complete row rather than the first. Without it every such coin is written twice
+per tick and its sighting count — which phase 3 uses to judge how well observed
+a coin is — inflates on nothing but layout.
+
+This is also why `source` gained `final-stretch` and `migrated`. `migrated` is
+not cosmetic: phase 4's run rule is peak market cap over a floor **or** having
+been seen in a migrated context, and that second clause is the only run signal
+that does not depend on having had the tab open at the right moment.
+
+### Structure
+
+`selectors.ts` holds every DOM assumption and nothing else may query the page.
+`parse.ts` holds the conversions, which are DOM-independent — `$44.8K` is 44800
+whatever markup wraps it — and was written and fully tested before the capture
+arrived, then needed no changes when it did. `observation.ts` assembles and
+tallies. `scrape.ts` is orchestration only.
+
+Two deviations from the spec's layout, both to keep the fragile part small:
+`parse.ts` and `observation.ts` are not in its file list. The spec says to
+isolate `scrape.ts` as the fragile part; splitting the *non*-fragile logic out
+is the same instruction applied honestly.
+
+### Things that cost time, or nearly did
+
+- `instanceof Element` in `scrape.ts` threw under test. jsdom's `Element` is not
+  the global one, and a content script and a test hold different realms. Now
+  duck-typed via `ownerDocument`, which is also the right answer for a fragment.
+- The fixture is 507KB, 318KB of which is Tailwind class attributes. Kept
+  deliberately: stripping them would let a selector accidentally depend on a
+  class name and still pass tests.
+- The scrubber refuses to write output still matching a JWT, bearer token, API
+  key, email or Next.js hydration payload. Raw captures are gitignored. A raw
+  capture carries the wallet address, balance and portfolio value, and this repo
+  is public.
+
+### Open
+
+- **No detail-page fixture yet.** The spec wants `/meme/<mint>` scraped too —
+  same mint key, richer fields, and it is where the answer is most wanted.
+  Needs a capture.
+- **The visibility gate is untested in anger.** `IntersectionObserver` gating is
+  wired and unit-tested through an injected predicate, but its real cost shows
+  up only against a live feed at 31 launches/minute.
+- **`ExtractionTally` is per-pass.** Judging "a few hundred rows" properly wants
+  it accumulated across passes and persisted. Phase 3 has storage; that is where
+  it belongs.
