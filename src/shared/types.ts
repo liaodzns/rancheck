@@ -115,3 +115,66 @@ export type ObservationSource =
   | "trending"
   | "detail"
   | "other";
+
+/**
+ * What the corpus keeps about one coin, across every sighting of it.
+ *
+ * Deliberately small. The budget is roughly 200 bytes per coin, because a feed
+ * left open produces ~45k launches a day and a corpus worth having is six
+ * figures of them. Text and a 16-character hash, never image bytes.
+ *
+ * The peaks are maxima across every sighting rather than the latest values, and
+ * that asymmetry is the point: a coin that touched $200k and fell back to $4k
+ * ran, and a schema that stored only what was last seen would forget that.
+ *
+ * `normName` and `normSymbol` are stored rather than computed on read because
+ * they are the index keys — see `index-store.ts`. They are the output of the
+ * frozen `normalize()`, so a change to it invalidates them and requires a
+ * schema bump, which is a good reason not to change it.
+ */
+export interface StoredCoin {
+  mint: Address;
+  name: string | null;
+  symbol: string | null;
+  /** `normalize(name)`, or "" when there was nothing to normalise. */
+  normName: string;
+  normSymbol: string;
+  /** Character trigrams of both normalised forms. The fuzzy-lookup index. */
+  trigrams: string[];
+  imageUrl: string | null;
+  /** Perceptual hash, 16 hex characters. Null until phase 4 has fetched it. */
+  phash: string | null;
+  firstSeen: Timestamp;
+  lastSeen: Timestamp;
+  peakMcUsd: number | null;
+  peakVolUsd: number | null;
+  /**
+   * Whether this coin ever cleared the run bar. Derived, stored, and the field
+   * the badge's primary number counts — see `worker/ran.ts`.
+   */
+  ran: boolean;
+  /**
+   * Whether it was ever seen in the Migrated column.
+   *
+   * Kept separately from `ran` because it is an observation and `ran` is a
+   * judgement. Moving the market-cap floor re-derives `ran`; it must not be
+   * able to erase the fact that a coin completed its bonding curve.
+   */
+  sawMigrated: boolean;
+  /** How many passes have seen this coin. A rough confidence in the peaks. */
+  sightings: number;
+}
+
+/** Corpus-wide bookkeeping. One record, and the honest-zero depends on it. */
+export interface CorpusMeta {
+  /**
+   * When this corpus started watching.
+   *
+   * Required, not optional. Without it a count of 0 is unreadable: it means
+   * either "never been run" or "we started on Tuesday", and those are opposite
+   * conclusions. Every surface showing a count has to be able to show this.
+   */
+  startedAt: Timestamp;
+  schemaVersion: number;
+  coinCount: number;
+}
