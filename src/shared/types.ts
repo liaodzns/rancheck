@@ -86,5 +86,32 @@ export interface PairObservation {
   volumeUsd: number | null;
   ageSeconds: number | null;
   seenAt: Timestamp;
-  source: "new-pairs" | "trending" | "detail" | "other";
+  source: ObservationSource;
 }
+
+/**
+ * Which surface a sighting came from.
+ *
+ * The spec's original union was `new-pairs | trending | detail | other`, written
+ * before anyone had looked at Pulse. The captured screen shows three columns —
+ * New Pairs, Final Stretch and Migrated — so `final-stretch` and `migrated` are
+ * added and `trending` is kept for Axiom's other surfaces.
+ *
+ * This is not cosmetic. Phase 4's "did it run" rule is peak market cap over a
+ * floor **or** the coin having been seen in a migrated context, and `migrated`
+ * is where that second clause comes from: a coin in that column has completed
+ * its bonding curve, which is the one run signal that does not depend on having
+ * had the tab open at the right moment. Without a value for it the classifier
+ * can only ever see what your screen happened to catch.
+ *
+ * `final-stretch` is not a run on its own — it is a coin close to migrating and
+ * it may still die there — but it is worth distinguishing from `new-pairs`
+ * rather than flattening both into one bucket we cannot separate later.
+ */
+export type ObservationSource =
+  | "new-pairs"
+  | "final-stretch"
+  | "migrated"
+  | "trending"
+  | "detail"
+  | "other";
