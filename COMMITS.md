@@ -305,3 +305,139 @@ Files:
 - `test/scrape.test.ts`
 - `NOTES.md`
 - `COMMITS.md`
+
+---
+
+## Phase 3 — corpus and the badge
+
+### `feat(shared): add stored-coin and corpus-meta shapes, and phase 3 thresholds`
+
+`StoredCoin` carries the peaks as maxima across every sighting rather than
+latest values, plus `sawMigrated` as an observation distinct from the `ran`
+judgement. `CorpusMeta.startedAt` is required, not optional — the honest zero
+depends on it.
+
+Thresholds: the $100k run floor (a guess, and the single number that decides
+whether the product is useful or noise), a three-day minimum corpus age before
+any count is shown, thirty-day retention for coins that never ran, and the
+200-candidate cap.
+
+Files:
+- `src/shared/types.ts`
+- `src/shared/config.ts`
+
+### `feat(worker): classify whether a coin ran, and merge sightings`
+
+`src/worker/ran.ts`. `ran` = peak market cap over the floor **or** seen in the
+Migrated column. The second clause is the only run signal that survives not
+having been watching.
+
+`mergeSighting` is pure and re-derives `ran` from stored fields, so moving the
+floor re-judges the whole corpus without a migration.
+
+Files:
+- `src/worker/ran.ts`
+- `test/ran.test.ts`
+
+### `feat(worker): generate candidates from IndexedDB indexes`
+
+`src/worker/index-store.ts`. Trigrams, phash bands, and the union-dedupe-cap.
+
+**Deviates from the spec's storage shape**: the spec's `{ key, mints[] }` rows
+make every insert a read-modify-write of an unbounded array. These are native
+IndexedDB indexes instead — same three lookup tables, maintained incrementally
+by the engine. Exact keys are queried before trigrams so the cap truncates the
+weakest signal first.
+
+Files:
+- `src/worker/index-store.ts`
+
+### `feat(worker): store the corpus in IndexedDB`
+
+`src/worker/corpus.ts`. The `coins` and `meta` stores, batched writes, candidate
+retrieval, and retention that never evicts a coin that ran.
+
+No corpus state in module scope — MV3 evicts the worker every ~30s idle, and a
+count from a stale cache is still a number with nothing to say it is wrong. Only
+the database handle persists, and `withDb` reopens it transparently.
+
+`CorpusSource` is the seam the spec asks for, read-only because writes are local
+by nature.
+
+Files:
+- `src/worker/corpus.ts`
+- `test/corpus.test.ts`
+
+### `feat(worker): count prior runs and route messages`
+
+`src/worker/lookup.ts` assembles the badge's two numbers and gates them on
+corpus age. `src/worker/index.ts` routes messages and runs retention on
+`chrome.alarms` rather than a timer, which would only fire while the worker
+happened to be alive.
+
+Files:
+- `src/worker/lookup.ts`
+- `src/worker/index.ts`
+- `src/shared/messages.ts`
+
+### `feat(content): paint the badge in a shadow-DOM overlay`
+
+`src/content/overlay.ts`. One fixed layer, positioned against
+`getBoundingClientRect()`, rAF-throttled, reads batched before writes. The
+page's DOM is never modified, and there is a test asserting the card's
+`outerHTML` is unchanged after badging.
+
+Below the minimum corpus age the badge shows the age instead of a number, and
+the popover restates the corpus age and the undercount caveat every time.
+
+Files:
+- `src/content/overlay.ts`
+- `test/overlay.test.ts`
+
+### `feat(content): record observations and request counts`
+
+Wires the phase-2 loop to the worker: observe, then look up, then badge. Node
+bindings are re-derived after the round-trip because the virtualiser may have
+recycled every card in between.
+
+Files:
+- `src/content/index.ts`
+- `manifest.json`
+- `scripts/build.mjs`
+
+### `docs: record phase 3 implementation notes`
+
+Files:
+- `NOTES.md`
+- `COMMITS.md`
+
+### `fix(content): stop a badge outliving the coin it belongs to`
+
+A stale badge could appear above a newly-inserted coin — the virtualised node
+recycling failure, where coin A's count is shown against coin B.
+
+Two causes, neither of them speed. Position was reconciled only on scroll, but
+New Pairs inserts at the top and shifts rows down via a DOM mutation, so badges
+sat at pixel positions that now belonged to the next coin down. And nothing
+re-checked which coin a card held, while the overlay keeps a node reference that
+recycling can repoint.
+
+Position and data now reconcile on different cadences: repositioning is a rect
+read and a style write, so it runs on every mutation and resize (rAF-throttled),
+while scrape and lookup stay debounced at 250ms. `reconcile()` additionally
+drops any badge whose card no longer holds its mint, via an injected
+`verifyMint` that abstains when it cannot tell.
+
+Also fixes the overlay tests, which jsdom's lack of layout had made partly
+vacuous: every rect was zero, so the zero-rect guard skipped every card and no
+badge existed to assert on. They now stub a layout box, assert the badge exists,
+and use the new `Overlay.flush()` instead of racing an animation frame. The
+recycling test was verified by mutation — it fails with the guard removed.
+
+Files:
+- `src/content/overlay.ts`
+- `src/content/selectors.ts`
+- `src/content/index.ts`
+- `test/overlay.test.ts`
+- `NOTES.md`
+- `COMMITS.md`

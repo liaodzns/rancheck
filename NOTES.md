@@ -296,3 +296,278 @@ is the same instruction applied honestly.
 - **`ExtractionTally` is per-pass.** Judging "a few hundred rows" properly wants
   it accumulated across passes and persisted. Phase 3 has storage; that is where
   it belongs.
+
+### Live run, 2026-09-20: the capture and the page disagreed
+
+First load into Chrome reported `mints resolve on 24/24 rows but marketCapUsd
+0%, volumeUsd 0% — likely a redesign`. The telemetry from this phase is the only
+reason that was a one-line message rather than a corpus quietly filling with
+coins that had no market cap.
+
+**The cause.** Axiom does not render a figure as one text node, and the
+committed capture and the live page split it differently:
+
+```
+capture   ["MC", "$3.17K"]          label, then the whole value
+live      ["MC", "$", "3.05K"]      label, currency symbol, magnitude
+```
+
+The extractor matched the label and took *the next token*, which live is `"$"`.
+Percentages split the same way (`["0", "%"]`), so this build separates units
+from numbers generally.
+
+Worth being clear about what the fixture did and did not buy here. It could not
+have predicted this — it is one capture from one build at one moment, and the
+whole point of the live run was to find what it does not cover. What it did do
+is make the failure legible in seconds: mints at 100% ruled out the row anchor
+and the column detection immediately, so the search space was two functions
+wide.
+
+**The fix, and the trap in the obvious version.** `joinValue` accumulates
+tokens after a label and keeps the **longest** run that forms a valid number.
+Taking the first valid join is the natural implementation and it is wrong: a
+figure split `["$", "3.05", "K"]` joins at two tokens into `$3.05`, dropping the
+magnitude. That is a thousandfold error, in the one field that decides whether
+a coin counts as having run, arriving as a number nothing about it looks wrong.
+There is a test for exactly that split.
+
+Label matching also became softer in the same pass, since a label is the only
+semantic handle on these values — there is no attribute and no stable class.
+Case, trailing colons, non-breaking spaces and aliases (`MCAP`, `Market Cap`,
+`Vol`) are all tolerated, and the merged one-node form (`<span>MC $3.05K</span>`)
+is handled alongside the split one. A one-letter label like `V` is safe only
+because of the money-shape check — a coin named `VICTORY` also starts with V,
+and there is a test for that too.
+
+Age got the same treatment but deliberately *not* the same mechanism: it joins
+only an exact digits-then-unit pair. A greedy join there could fuse a
+neighbouring holder count onto the age and turn `5s` into `15s`, which nothing
+downstream would flag. Two different join rules for two different risk profiles
+is the right answer, not an inconsistency.
+
+**`touchesSub` now checks both directions.** The subscript guard tested whether
+a token's parent *contains* a `<sub>`, which catches the siblings (`0.0`, `5`)
+but not the subscript's own content (`4`, whose parent *is* the `<sub>`).
+Half-guarding is worse than not guarding: the digits that get through still look
+like a number.
+
+**The extension now diagnoses itself.** On detecting degradation it prints the
+first card's token list and resolved fields. That is what turned a second round
+of guessing into a fix — the first attempt at this was made blind and did not
+work. A console snippet would not have done: a content script runs in an
+isolated world, so `window.__rancheck` is not reachable from the console without
+switching the context dropdown, which is a bad thing to learn mid-debugging.
+
+The live token stream is committed as a test verbatim. A real degraded stream is
+worth more as a test than as a paragraph.
+
+---
+
+## Phase 3 — corpus and the badge
+
+Goal from the spec: IndexedDB, the indexes, the overlay. `3 / 47`, click for a
+popover listing prior runs with image, first-seen date, peak MC and an
+`axiomLink()` per row. Corpus age in the header, always. The first version worth
+using.
+
+**Status: done.** 187 tests, `npm run check` clean, both bundles build.
+
+### Corpus source: settled before writing any of it
+
+Asked and answered up front. The corpus is **self-accumulated and local** —
+every pair this browser has rendered, in IndexedDB, nothing queried from
+anywhere. That is the spec's option (1), and phase 5's importer is what fixes
+the cold start.
+
+The alternative worth recording, because it will come up again: a public index
+like DexScreener is *not* ruled out by "no paid APIs" — it is free and keyless.
+It is ruled out as a badge source by what it can and cannot count. The badge is
+`ran / total`, and those two numbers have opposite failure modes:
+
+- The local corpus is good at the **denominator** and bad at the **numerator**.
+  It sees every launch that crossed the screen including the 44 that died, but a
+  coin that ran at 3am is stored with whatever peak was last seen.
+- A public index is the mirror image. It indexes pairs worth indexing, so it is
+  decent at "did something with this name ever run" and will never enumerate 47
+  deployments of a ticker, most of which are dead and unindexed.
+
+So it cannot replace the corpus; it could complement it, on demand in the
+popover, one request per deliberate click. `CorpusSource` is the seam and it is
+read-only for exactly this reason — writes are local by nature, since they are
+what *this* browser saw, and an external source has nothing to write to.
+
+### The spec's index shape would not have survived contact with the feed
+
+The spec describes an `index` object store of `{ key, mints[] }` rows. That is
+the right concept and the wrong implementation: every insert becomes a
+read-modify-write of an array that, for a hot key, grows without bound. Storing
+one coin whose name shares a trigram with 40,000 others means reading a
+40,000-element array, pushing, and writing it back — at 31 launches a minute.
+
+IndexedDB implements that concept natively and incrementally, so the three
+lookup tables are indexes on the `coins` store instead: `normName`/`normSymbol`,
+a multiEntry index on `trigrams`, and a multiEntry index on `phashBands` that
+stays empty until phase 4. Same union-and-dedupe at query time, no quadratic
+write.
+
+Their relative weight is not close and the code says so: `byNorm` is the ~98%
+path (5.64 of 5.71 mean matches), and trigrams cost the most storage of the
+three while buying the least. Trigrams are there so the popover can be as good
+as the matcher is, not because the badge needs them.
+
+### Ordering inside candidate generation is load-bearing
+
+Exact normalised keys are queried first, then phash bands, then trigrams. That
+is not stylistic: when the 200-cap truncates, what survives should be the ~98%
+path rather than whatever a trigram dragged in. Truncation can only ever lose
+matches, never invent them — `matchCorpus` is correct on any list — so the cap
+is a cost bound and the ordering is what keeps its effect benign.
+
+The blank-name failure has a second door here, and it is shut separately. An
+empty normalised key used as an index lookup would retrieve every coin whose
+name failed to normalise. `candidatesFor` skips any key below
+`narrative.minLength`, and there is a test that an unnamed subject against a
+corpus of unnamed coins returns nothing.
+
+### The merge rules are the corpus's real semantics
+
+`mergeSighting` is pure and every rule in it is deliberate:
+
+- **Peaks take the maximum, never the latest.** A coin that touched $200k and
+  fell back to $4k ran. Storing the latest reading forgets that, silently.
+- **A null never lowers a peak.** A market-cap column that failed to parse is an
+  absence of evidence, not evidence of zero.
+- **Text fills gaps but does not overwrite.** Axiom truncates long names in some
+  columns, so a later sighting is as likely to be worse as better.
+- **`sawMigrated` latches.** It is kept separate from `ran` because it is an
+  observation and `ran` is a judgement: moving the market-cap floor re-derives
+  every verdict, and must not be able to erase the fact that a coin completed
+  its bonding curve.
+
+That last point is why `ran` is recomputed from stored fields rather than frozen
+at write time — the floor is a guess and will move.
+
+### The honest zero, implemented rather than intended
+
+`isConfident` gates the badge on corpus age, and below the threshold the badge
+renders `new corpus · 2 days` instead of a number. There is a test asserting the
+rendered output contains no `0` at all in that state, because a muted zero is
+still a zero and a user will read it as "never been run".
+
+The popover states the corpus age and the undercount caveat **every time**, not
+once. The undercount is structural — the corpus only ever saw what was on
+screen — so it does not stop being true after the user has read it.
+
+`matchedOn` is rendered as "recognised by name", never "name matches". The
+port's comment is explicit that it means what was recognisable, not that the
+fields are equal, and the popover is the one place that distinction becomes
+visible to a person.
+
+### MV3 shaped the worker more than anything else
+
+No corpus state in module scope. The one thing held across messages is the
+database *handle*, which is not state: `withDb` treats `InvalidStateError` from
+a dead connection as the normal case and reopens. A cached count that survived
+an eviction is worse than no count, because it is still a number and nothing
+about it says it is wrong.
+
+Retention runs on `chrome.alarms`, not `setInterval`. A timer in an MV3 worker
+only fires while the worker happens to be alive, which is to say almost never
+and unpredictably.
+
+Lookups are sequential rather than `Promise.all`. Forty concurrent IndexedDB
+transactions contend with each other and with the observe path, and the
+wall-clock win is not worth the jank it puts on Axiom's rendering.
+
+### The overlay, and the rule it exists to enforce
+
+Never write inside a row. Badges live in one fixed-position shadow-DOM layer,
+positioned against `getBoundingClientRect()`, rAF-throttled on scroll. There is
+a test asserting the card's `outerHTML` is byte-identical after badging.
+
+Two details that took thought:
+
+- **Reads are batched before writes.** Every rect is read, then every badge is
+  positioned. Interleaving forces a layout flush per badge — forty synchronous
+  layouts a frame with a full screen.
+- **A zero-size rect is skipped, not painted.** A recycled or scrolled-away card
+  reports one, and painting there puts coin A's count on coin B — the exact
+  failure the spec lists under virtualised node recycling.
+
+Node bindings are re-derived in `resolveBadges` rather than carried from the
+scrape, because the worker round-trip is long enough for the virtualiser to have
+recycled every card on screen in between. Keying by mint is what makes that
+safe.
+
+### A test bug worth recording
+
+`mint(n)` padded with `"1"`, so `mint(1)` and `mint(11)` were the same string
+and nine of thirty "distinct" mints collided. The assertion failed at 21 of 30 —
+and the corpus was right: it had correctly merged duplicate mints into one coin
+each. The fix was the helper, and the behaviour it accidentally demonstrated is
+now a test of its own.
+
+### Open
+
+- **Nothing is measured against a real corpus yet.** Every performance claim
+  here is reasoning, not measurement. The spec asks for a sub-50ms worker wake
+  and that number has not been checked against 50k coins.
+- **Trigram storage is unmeasured.** It is the largest per-coin cost and the
+  smallest contributor; worth measuring before the corpus gets large rather
+  than after.
+- **`phashBands` is wired end to end and always empty.** Phase 4 fills it.
+- **No pair detail page.** Still the surface where the answer is most wanted.
+
+### Stale badges over newly-inserted coins, 2026-09-20
+
+Reported after live use: an old badge sometimes appears above a new coin. This
+is the failure the spec lists under virtualised node recycling — "badge shows
+coin A's count on coin B" — and it is the worst one available here, because a
+wrong count is indistinguishable from a right one.
+
+The proposed fix was to refresh faster. That would have narrowed the window
+without closing it, and spent main-thread time on a feed that is already busy.
+There were two separate causes and neither is a speed problem.
+
+**Position was only reconciled on scroll.** New Pairs inserts at the top, which
+shifts every row below it down by a row height — a DOM mutation, not a scroll.
+No listener fired, so each badge sat at its old pixel position, which by then
+belonged to the next coin down. The spec did say to reconcile on
+`ResizeObserver` as well and that had simply not been wired.
+
+**Nothing re-checked which coin a card held.** The overlay keeps `target.card`,
+a node reference captured when the lookup returned. Virtualised lists recycle
+nodes, so that reference can come to hold a different coin, and the badge would
+keep asserting the old number over it.
+
+The fix separates the two cadences, which is the shape the problem actually has:
+
+- **Position is cheap** — a rect read and a style write — so it reconciles
+  immediately on every mutation and resize, rAF-throttled. Self-regulating: a
+  still feed costs nothing.
+- **Data is expensive** — scrape plus a worker round-trip — so it stays
+  debounced at 250ms, unchanged.
+
+On top of that, `reconcile()` now re-reads each card's mint and drops any badge
+whose card no longer holds the coin it is about. `verifyMint` is injected rather
+than imported, so `overlay.ts` still knows nothing about what an Axiom card
+looks like, and it abstains on null in keeping with the rest of the codebase: a
+check like this may veto, but must never be why a good badge disappears.
+
+`mintAttrOf` exists because `mintOf` is the thorough version — it will query
+images and links when the attribute is missing — and that is wrong on a path
+that runs per badge per frame. The cheap version is one attribute read.
+
+**The existing overlay tests were weaker than they looked.** jsdom performs no
+layout, so every `getBoundingClientRect()` returned zeros, the overlay's
+zero-rect guard skipped every card, and no badge was ever created. Several tests
+had been asserting things about badges with no badge present. They now stub a
+layout box and assert the badge exists before asserting anything about it.
+
+Placement is also rAF-deferred, so tests were racing a frame. `Overlay.flush()`
+forces a synchronous reconcile rather than having tests guess at timing.
+
+The recycling test was verified by mutation: with the guard commented out it
+fails, with it restored it passes. Worth doing for this one — it is the test
+standing between the product and silently attributing one coin's history to
+another.

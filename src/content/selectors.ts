@@ -420,3 +420,20 @@ export function describeCard(card: Element): {
     fields: readCard(card),
   };
 }
+
+/**
+ * The mint from the card's own attribute, with no fallbacks.
+ *
+ * `mintOf` is the thorough version and will fetch images and links to find a
+ * mint when the attribute is missing. That is right when reading a card once;
+ * it is wrong on a hot path. This is the cheap version — one attribute read and
+ * a regex — for the overlay, which re-checks every badge against its card on
+ * every animation frame the feed moves.
+ *
+ * Returns null when there is no usable attribute, which the caller must read as
+ * "cannot tell" rather than "wrong card". The check can only ever veto.
+ */
+export function mintAttrOf(card: Element): string | null {
+  const attr = card.getAttribute(MINT_ATTR)?.trim() ?? "";
+  return isFullMint(attr) ? attr : null;
+}
