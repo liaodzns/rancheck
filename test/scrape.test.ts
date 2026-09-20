@@ -14,7 +14,8 @@ import { readFileSync } from "node:fs";
 import { JSDOM } from "jsdom";
 import { beforeAll, describe, expect, it } from "vitest";
 import { scrape } from "../src/content/scrape.js";
-import { columnOf, findCards, mintOf, readCard } from "../src/content/selectors.js";
+import { toObservation } from "../src/content/observation.js";
+import { columnOf, describeCard, findCards, mintOf, readCard } from "../src/content/selectors.js";
 import type { ScrapeResult } from "../src/content/scrape.js";
 
 const FIXTURE = new URL("../fixtures/axiom-dom/pulse-2026-09-19.html", import.meta.url);
@@ -240,5 +241,167 @@ describe("the pass as a whole", () => {
     const nothing = scrape(empty, { now: NOW });
     expect(nothing.observations).toEqual([]);
     expect(nothing.diagnosis.health).toBe("cold");
+  });
+});
+
+describe("label variants", () => {
+  /**
+   * Build a minimal card with the figures rendered a given way.
+   *
+   * These are synthetic on purpose. The committed capture shows one rendering;
+   * a live page showed another, and the point of these is that neither is
+   * assumed to be the only one.
+   */
+  const cardWith = (inner: string): Element => {
+    const d = new JSDOM(
+      `<!DOCTYPE html><html><body><section><div>New Pairs</div>` +
+        `<div data-pulse-token-address="1TGF97nuz88QXET6KjnC6JK3ZuS27FJvPtTvEZEq2BH">` +
+        `${inner}<span>1TGF...q2BH</span><div>RogueGPT</div><div>The Rogue AI</div>` +
+        `<span>9m</span></div></section></body></html>`,
+      { url: "https://axiom.trade/pulse" },
+    ).window.document;
+    return d.querySelector("[data-pulse-token-address]")!;
+  };
+
+  it("reads the split rendering the capture uses", () => {
+    const raw = readCard(cardWith("<span>V</span><span>$66</span><span>MC</span><span>$3.17K</span>"));
+    expect(raw.volume).toBe("$66");
+    expect(raw.marketCap).toBe("$3.17K");
+  });
+
+  it("reads a merged rendering, where label and value share a node", () => {
+    // The failure that took live extraction to 0% while mints stayed at 100%.
+    const raw = readCard(cardWith("<span>V $66</span><span>MC $3.17K</span>"));
+    expect(raw.volume).toBe("$66");
+    expect(raw.marketCap).toBe("$3.17K");
+  });
+
+  it("tolerates a non-breaking space between label and value", () => {
+    const raw = readCard(cardWith("<span>V $66</span><span>MC $3.17K</span>"));
+    expect(raw.volume).toBe("$66");
+    expect(raw.marketCap).toBe("$3.17K");
+  });
+
+  it("tolerates case and a trailing colon", () => {
+    const raw = readCard(cardWith("<span>Vol:</span><span>$66</span><span>mcap:</span><span>$3.17K</span>"));
+    expect(raw.volume).toBe("$66");
+    expect(raw.marketCap).toBe("$3.17K");
+  });
+
+  it("accepts the long labels a redesign might switch to", () => {
+    const raw = readCard(cardWith("<span>Volume</span><span>$66</span><span>Market Cap</span><span>$3.17K</span>"));
+    expect(raw.volume).toBe("$66");
+    expect(raw.marketCap).toBe("$3.17K");
+  });
+
+  it("does not mistake a coin name beginning with V for a volume label", () => {
+    // `V` is a one-letter label and a prefix of plenty of real words. Only the
+    // money-shape check stands between it and nonsense.
+    const raw = readCard(cardWith("<span>VICTORY</span><span>MC</span><span>$3.17K</span>"));
+    expect(raw.volume).toBeNull();
+    expect(raw.marketCap).toBe("$3.17K");
+  });
+
+  it("returns null rather than a wrong number for a subscript value", () => {
+    const raw = readCard(cardWith("<span>MC</span><span>0.0<sub>5</sub>4</span>"));
+    expect(raw.marketCap).toBeNull();
+  });
+});
+
+describe("describeCard", () => {
+  it("reports tokens and resolved fields for diagnosis", () => {
+    // What the extension prints to the console when it notices it is degraded,
+    // so a live disagreement with the fixture can be read rather than guessed.
+    const card = findCards(doc)[0]!;
+    const described = describeCard(card);
+    expect(described.mint).toMatch(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+    expect(described.tokens).toContain("MC");
+    expect(described.fields.marketCap).toBe("$3.17K");
+  });
+});
+
+describe("the live rendering that split the currency symbol", () => {
+  /**
+   * Reproduced verbatim from a degraded live run on 2026-09-20.
+   *
+   * Mints resolved on 24/24 rows while marketCapUsd and volumeUsd sat at 0%.
+   * The committed capture renders a figure as `["MC", "$3.17K"]`; this build
+   * renders it as `["MC", "$", "3.05K"]`, and percentages split the same way.
+   * Nothing in the fixture could have predicted it, which is the argument for
+   * keeping a real degraded token stream as a test rather than a note.
+   */
+  const liveCard = (): Element => {
+    const d = new JSDOM(
+      `<!DOCTYPE html><html><body><section><div>New Pairs</div>` +
+        `<div data-pulse-token-address="8NsUuh5UqWsTttyaCW4wZaZ913xupQbu4fBk3boG5Sj2">` +
+        `<span>0.03</span><span>SOL</span><span>0.03</span><span>SOL</span>` +
+        `<span>V</span><span>$</span><span>0</span>` +
+        `<span>MC</span><span>$</span><span>3.05K</span>` +
+        `<span>F</span><span>0</span><span>TX</span><span>1</span><span>348</span>` +
+        `<span>8NsU...5Sj2</span><div>REBORN</div><div>Zerebr0 Reborn</div>` +
+        `<span>14s</span><span>0</span><span>0</span>` +
+        `<span>0</span><span>%</span><span>0%</span></div></section></body></html>`,
+      { url: "https://axiom.trade/pulse" },
+    ).window.document;
+    return d.querySelector("[data-pulse-token-address]")!;
+  };
+
+  it("reads a figure split across currency symbol and magnitude", () => {
+    const raw = readCard(liveCard());
+    expect(raw.marketCap).toBe("$3.05K");
+    expect(raw.volume).toBe("$0");
+  });
+
+  it("produces a complete observation from it", () => {
+    const { observation } = toObservation(readCard(liveCard()), "new-pairs", NOW);
+    expect(observation!.marketCapUsd).toBe(3050);
+    // Zero is a real volume, and must survive as 0 rather than collapsing to
+    // null — the tally counts a null as a failed extraction.
+    expect(observation!.volumeUsd).toBe(0);
+    expect(observation!.name).toBe("Zerebr0 Reborn");
+    expect(observation!.symbol).toBe("REBORN");
+    expect(observation!.ageSeconds).toBe(14);
+  });
+
+  it("keeps the magnitude when the number itself is split", () => {
+    // The trap in the obvious fix. Taking the first valid join reads
+    // ["$", "3.05", "K"] as $3.05 and drops the K — a thousandfold error, in
+    // the field that decides whether a coin counts as having run.
+    const d = new JSDOM(
+      `<!DOCTYPE html><html><body><section><div>New Pairs</div>` +
+        `<div data-pulse-token-address="8NsUuh5UqWsTttyaCW4wZaZ913xupQbu4fBk3boG5Sj2">` +
+        `<span>MC</span><span>$</span><span>3.05</span><span>K</span>` +
+        `<span>8NsU...5Sj2</span><div>REBORN</div><div>Reborn</div><span>14s</span>` +
+        `</div></section></body></html>`,
+      { url: "https://axiom.trade/pulse" },
+    ).window.document;
+    const raw = readCard(d.querySelector("[data-pulse-token-address]")!);
+    expect(raw.marketCap).toBe("$3.05K");
+  });
+
+  it("reads an age split into number and unit", () => {
+    const d = new JSDOM(
+      `<!DOCTYPE html><html><body><section><div>New Pairs</div>` +
+        `<div data-pulse-token-address="8NsUuh5UqWsTttyaCW4wZaZ913xupQbu4fBk3boG5Sj2">` +
+        `<span>8NsU...5Sj2</span><div>REBORN</div><div>Reborn</div>` +
+        `<span>14</span><span>s</span></div></section></body></html>`,
+      { url: "https://axiom.trade/pulse" },
+    ).window.document;
+    const raw = readCard(d.querySelector("[data-pulse-token-address]")!);
+    expect(raw.age).toBe("14s");
+  });
+
+  it("does not fuse a neighbouring count onto the age", () => {
+    // `1` then `5s` must not become `15s`. The age join is restricted to an
+    // exact digits-then-unit pair for this reason.
+    const d = new JSDOM(
+      `<!DOCTYPE html><html><body><section><div>New Pairs</div>` +
+        `<div data-pulse-token-address="8NsUuh5UqWsTttyaCW4wZaZ913xupQbu4fBk3boG5Sj2">` +
+        `<span>8NsU...5Sj2</span><div>REBORN</div><div>Reborn</div>` +
+        `<span>1</span><span>5s</span></div></section></body></html>`,
+      { url: "https://axiom.trade/pulse" },
+    ).window.document;
+    const raw = readCard(d.querySelector("[data-pulse-token-address]")!);
+    expect(raw.age).toBe("5s");
   });
 });

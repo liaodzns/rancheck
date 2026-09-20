@@ -169,22 +169,132 @@ function tokensOf(card: Element): Token[] {
 /** Axiom's compact duration, as rendered in the age slot: `1s`, `4m`, `1h`. */
 const DURATION_SHAPE = /^\d+(?:\.\d+)?\s*[smhdw]$/i;
 
+/** A money-shaped token: `$44.8K`, `$66`, `1.2M`. */
+const MONEY_SHAPE = /^\$?\d[\d,]*(?:\.\d+)?\s*[KMBT]?$/i;
+
 /**
- * The value token following a label token such as `MC` or `V`.
+ * Labels for the two figures we store, most specific first.
  *
- * Returns null when the value sits in a subtree containing a `<sub>`, because
- * that is the subscript notation described above and no single text node from
- * it can be read as the whole number.
+ * Aliases rather than one string because the label is the *only* semantic
+ * handle on these values — there is no attribute and no stable class — and it
+ * is the kind of thing a redesign renames without meaning anything by it.
  */
-function valueAfterLabel(tokens: Token[], label: string): string | null {
-  const index = tokens.findIndex((token) => token.text === label);
-  if (index === -1) return null;
+const MARKET_CAP_LABELS = ["MC", "MCAP", "M.CAP", "MKT CAP", "MARKET CAP"];
+const VOLUME_LABELS = ["V", "VOL", "VOLUME"];
 
-  const value = tokens[index + 1];
-  if (value === undefined) return null;
-  if (value.parent?.querySelector("sub") != null) return null;
+/**
+ * Whether a token is entangled with subscript notation.
+ *
+ * Checks both directions. A token can be a *sibling* of the `<sub>` (`0.0` and
+ * `5` in `0.0<sub>4</sub>5`, whose parent contains it) or it can be the
+ * subscript's own content (`4`, whose parent *is* it). Testing only one
+ * direction lets half the digits through, which is worse than reading none of
+ * them, because what gets through still looks like a number.
+ */
+function touchesSub(token: Token): boolean {
+  const parent = token.parent;
+  if (parent == null) return false;
+  return parent.closest("sub") !== null || parent.querySelector("sub") !== null;
+}
 
-  return value.text;
+/**
+ * Join consecutive tokens from `start` into the longest run that forms a value.
+ *
+ * Axiom does not render a figure as one text node. The committed capture splits
+ * it one way and a live page splits it another:
+ *
+ *   capture   ["MC", "$3.17K"]           label, then the whole value
+ *   live      ["MC", "$", "3.05K"]       label, currency, magnitude
+ *
+ * and nothing says a build will not split it further still. So rather than
+ * encode a shape count, this accumulates and keeps the **longest** run that
+ * parses — which is the part that matters. Taking the first match would read
+ * `["$", "3.05", "K"]` as `$3.05` and drop the K: a thousandfold error, in the
+ * exact field that decides whether a coin counts as having run, arriving as a
+ * number that looks entirely reasonable.
+ *
+ * Accumulation stops at a subscript rather than reading through it.
+ */
+function joinValue(
+  tokens: Token[],
+  start: number,
+  maxParts: number,
+  shape: RegExp,
+): string | null {
+  let joined = "";
+  let best: string | null = null;
+
+  for (let n = 0; n < maxParts && start + n < tokens.length; n++) {
+    const token = tokens[start + n] as Token;
+    if (touchesSub(token)) break;
+    joined += token.text.replace(/ /g, " ").trim();
+    if (shape.test(joined)) best = joined;
+  }
+
+  return best;
+}
+
+/** Fold the cosmetic variation out of a label before comparing it. */
+function labelKey(text: string): string {
+  return text
+    .replace(/ /g, " ")
+    .replace(/[:\s]+$/, "")
+    .trim()
+    .toUpperCase();
+}
+
+/**
+ * The value for a label such as `MC` or `V`.
+ *
+ * Handles both renderings, because the captured page uses the first and a live
+ * page was observed using neither:
+ *
+ *   split   `<span>MC</span><span>$3.17K</span>`   → two tokens
+ *   merged  `<span>MC $3.17K</span>`               → one token
+ *
+ * The original version required the split form and an exact string match, which
+ * is why live extraction fell to 0% while mints stayed at 100%. Matching a
+ * label is inherently softer than matching an attribute, so it is done softly:
+ * case-insensitive, trailing colon and non-breaking space tolerated, aliases
+ * accepted.
+ *
+ * Returns null when the value sits in a subtree containing a `<sub>` — that is
+ * the subscript notation, and no single text node from it can be read as the
+ * whole number.
+ */
+function valueForLabels(tokens: Token[], labels: readonly string[]): string | null {
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i] as Token;
+    const key = labelKey(token.text);
+
+    for (const label of labels) {
+      // Split form: the token is exactly the label and the value follows, in
+      // however many pieces this build happens to render it.
+      if (key === label) {
+        const next = tokens[i + 1];
+        if (next === undefined) continue;
+        // A subscript value is refused outright rather than skipped: we found
+        // the figure and established that it cannot be read correctly, which is
+        // different from not having found it.
+        if (touchesSub(next)) return null;
+        const value = joinValue(tokens, i + 1, 4, MONEY_SHAPE);
+        if (value !== null) return value;
+        continue;
+      }
+
+      // Merged form: the label and its value share one text node. The money
+      // check is what makes a one-letter label like `V` safe here — a coin
+      // named VICTORY starts with V too, and only this rejects it.
+      if (key.startsWith(label)) {
+        const rest = token.text.replace(/ /g, " ").trim().slice(label.length).trim();
+        if (rest.length > 0 && MONEY_SHAPE.test(rest)) {
+          if (token.parent?.querySelector("sub") != null) return null;
+          return rest;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -254,6 +364,16 @@ export function readCard(card: Element): RawRow {
         age = candidate;
         break;
       }
+      // The same build that renders `MC $ 3.05K` across three nodes also
+      // renders `0 %` across two, so a duration may well arrive as `14` `s`.
+      // Joined only on an exact digits-then-unit pair rather than through the
+      // greedy `joinValue`: a loose join here could fuse a holder count onto
+      // the age and turn `5s` into `15s` without anything looking wrong.
+      const next = tokens[i + 1]?.text ?? "";
+      if (/^\d+(?:\.\d+)?$/.test(candidate) && /^[smhdw]$/i.test(next)) {
+        age = candidate + next;
+        break;
+      }
     }
   }
 
@@ -271,8 +391,32 @@ export function readCard(card: Element): RawRow {
     // identical-URI shortcut therefore never fires from this surface; the
     // image URL is the usable proxy, and phase 4 uses it.
     metadataUri: null,
-    marketCap: valueAfterLabel(tokens, "MC"),
-    volume: valueAfterLabel(tokens, "V"),
+    marketCap: valueForLabels(tokens, MARKET_CAP_LABELS),
+    volume: valueForLabels(tokens, VOLUME_LABELS),
     age,
+  };
+}
+
+/**
+ * What a card actually contains, for when extraction is failing on a live page
+ * and the committed fixture cannot explain why.
+ *
+ * The scraper degrading is not hypothetical — it happened on the first live
+ * run, with mints at 100% and both figures at 0%, and the capture in
+ * `fixtures/` disagreed with the page in front of the user. Rather than trade
+ * guesses, the extension prints this itself when it notices it is degraded.
+ *
+ * Deliberately just the token list and the resolved fields: enough to see which
+ * assumption broke, and nothing that identifies the person running it.
+ */
+export function describeCard(card: Element): {
+  mint: string | null;
+  tokens: string[];
+  fields: RawRow;
+} {
+  return {
+    mint: mintOf(card),
+    tokens: tokensOf(card).map((token) => token.text),
+    fields: readCard(card),
   };
 }

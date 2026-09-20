@@ -24,7 +24,7 @@
  * here, and there must never be.
  */
 import { scrape } from "./scrape.js";
-import { SELECTORS } from "./selectors.js";
+import { SELECTORS, describeCard } from "./selectors.js";
 import type { PairObservation } from "../shared/types.js";
 
 /**
@@ -104,8 +104,30 @@ function pass(reason: string): void {
     log("extraction", result.report, result.diagnosis.message);
     if (result.diagnosis.health === "fields-failing" || result.diagnosis.health === "mints-failing") {
       console.warn("[rancheck] scraper is degraded:", result.diagnosis.message);
+      dumpFirstCard();
     }
   }
+}
+
+/**
+ * Print one card's innards when extraction is failing.
+ *
+ * A degraded scraper means the committed fixture and the live page disagree,
+ * and the fixture cannot say how. Printing it automatically beats asking
+ * someone to paste a console snippet: the isolated world a content script runs
+ * in is not the console's default context, so `window.__rancheck` would not
+ * even be reachable without switching the context dropdown first.
+ *
+ * One card, tokens and resolved fields only. Enough to see which assumption
+ * broke; nothing that identifies whoever is running it.
+ */
+function dumpFirstCard(): void {
+  const card = document.querySelector(SELECTORS.card);
+  if (card === null) return;
+  console.warn(
+    "[rancheck] first card, for diagnosis — paste this into the issue:",
+    JSON.stringify(describeCard(card), null, 2),
+  );
 }
 
 /** A compact console view. The full objects are one expand away in devtools. */

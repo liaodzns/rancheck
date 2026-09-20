@@ -279,3 +279,29 @@ Files:
 - `NOTES.md`
 - `COMMITS.md`
 
+
+### `fix(content): read figures split across several text nodes`
+
+Live extraction reported market cap and volume at 0% while mints held at 100%.
+Axiom renders a figure as `["MC", "$", "3.05K"]` on some builds and
+`["MC", "$3.17K"]` on the one captured, and the extractor took only the token
+after the label.
+
+`joinValue` now accumulates following tokens and keeps the longest run that
+forms a valid number — longest, not first, because `["$", "3.05", "K"]` joins at
+two into `$3.05` and silently drops the magnitude. Label matching tolerates
+case, trailing colons, non-breaking spaces, aliases and the merged one-node
+form. Age joins only an exact digits-then-unit pair, so a neighbouring count
+cannot fuse onto it. `touchesSub` now checks both directions, so the subscript
+guard no longer lets the subscript's own digits through.
+
+The content script prints the offending card's tokens when it detects
+degradation, which is what made the second attempt at this a fix rather than
+another guess. The live token stream is committed as a regression test verbatim.
+
+Files:
+- `src/content/selectors.ts`
+- `src/content/index.ts`
+- `test/scrape.test.ts`
+- `NOTES.md`
+- `COMMITS.md`
