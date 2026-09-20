@@ -176,6 +176,45 @@ const fromRecord = (record: CoinRecord | undefined): StoredCoin | null => {
 };
 
 /**
+ * A write transaction over the corpus, with the plumbing already done.
+ *
+ * Exists so that anything writing coins — the observe path, the importer —
+ * shares one definition of what a write is. Two hand-rolled transactions would
+ * eventually disagree about whether `phashBands` gets recomputed or whether
+ * `coinCount` gets updated, and the disagreement would be invisible.
+ */
+export interface CoinWrite {
+  get(mint: string): Promise<StoredCoin | null>;
+  put(coin: StoredCoin): void;
+  meta(): Promise<CorpusMeta | undefined>;
+  putMeta(meta: CorpusMeta): void;
+}
+
+/** Run `fn` inside one read-write transaction over coins and meta. */
+export async function withCoinsWrite<T>(fn: (write: CoinWrite) => Promise<T>): Promise<T> {
+  return withDb(async (db) => {
+    const tx = db.transaction([COINS, META], "readwrite");
+    const coins = tx.objectStore(COINS);
+    const metaStore = tx.objectStore(META);
+
+    const result = await fn({
+      get: async (mint) =>
+        fromRecord((await promisify(coins.get(mint))) as CoinRecord | undefined),
+      put: (coin) => {
+        coins.put(toRecord(coin));
+      },
+      meta: async () => (await promisify(metaStore.get(META_KEY))) as CorpusMeta | undefined,
+      putMeta: (value) => {
+        metaStore.put(value, META_KEY);
+      },
+    });
+
+    await done(tx);
+    return result;
+  });
+}
+
+/**
  * Record a pass's worth of sightings.
  *
  * One transaction for the batch. A pass produces up to forty rows and forty
@@ -192,37 +231,27 @@ export async function recordObservations(
 ): Promise<StoredCoin[]> {
   if (observations.length === 0) return [];
 
-  return withDb(async (db) => {
-    const tx = db.transaction([COINS, META], "readwrite");
-    const coins = tx.objectStore(COINS);
-    const meta = tx.objectStore(META);
-
-    const existingMeta = (await promisify(meta.get(META_KEY))) as CorpusMeta | undefined;
+  return withCoinsWrite(async (write) => {
+    const existingMeta = await write.meta();
     const written: StoredCoin[] = [];
 
     for (const observation of observations) {
-      const prior = fromRecord(
-        (await promisify(coins.get(observation.mint))) as CoinRecord | undefined,
-      );
+      const prior = await write.get(observation.mint);
       const normalised = normaliseText(observation.name, observation.symbol, thresholds.corpus);
       const merged = mergeSighting(prior, observation, normalised, thresholds.ran);
-      coins.put(toRecord(merged));
+      write.put(merged);
       written.push(merged);
     }
 
     const added = written.filter((coin) => coin.sightings === 1).length;
-    meta.put(
-      {
-        // Set once and never moved. The honest-zero depends on this being the
-        // moment watching started, not the moment of the most recent write.
-        startedAt: existingMeta?.startedAt ?? now,
-        schemaVersion: SCHEMA_VERSION,
-        coinCount: (existingMeta?.coinCount ?? 0) + added,
-      } satisfies CorpusMeta,
-      META_KEY,
-    );
+    write.putMeta({
+      // Set once and never moved. The honest-zero depends on this being the
+      // moment watching started, not the moment of the most recent write.
+      startedAt: existingMeta?.startedAt ?? now,
+      schemaVersion: SCHEMA_VERSION,
+      coinCount: (existingMeta?.coinCount ?? 0) + added,
+    } satisfies CorpusMeta);
 
-    await done(tx);
     return written;
   });
 }

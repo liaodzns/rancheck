@@ -114,6 +114,15 @@ export type ObservationSource =
   | "migrated"
   | "trending"
   | "detail"
+  /**
+   * Seeded from a recording rather than seen on a screen.
+   *
+   * Carries no market cap and no migration, because the launch feed has
+   * neither, so an imported coin can never count as having run on its own.
+   * That is the honest outcome rather than a gap to paper over: seeding fixes
+   * how many deployments you know about, not how many of them you watched.
+   */
+  | "imported"
   | "other";
 
 /**
