@@ -5,9 +5,10 @@
  * here matches anything itself — that would be a second matcher, and the whole
  * discipline of the port is that there is exactly one.
  */
-import type { CorpusMeta, StoredCoin } from "../shared/types.js";
+import type { CorpusMeta, NarrativeMatch, StoredCoin } from "../shared/types.js";
 import { THRESHOLDS, type Thresholds } from "../shared/config.js";
-import { matchCorpus, type CorpusMatch } from "./match-corpus.js";
+import { matchCorpus } from "./match-corpus.js";
+import { hammingDistance } from "./phash.js";
 import { ranEvidence, type RanEvidence } from "./ran.js";
 import type { CandidateSubject, CorpusSource } from "./corpus.js";
 
@@ -24,7 +25,15 @@ export interface PriorRun {
   evidence: RanEvidence;
   similarity: number;
   /** What was recognisable about the stored coin — never "these fields are equal". */
-  matchedOn: CorpusMatch<never>["matchedOn"];
+  matchedOn: NarrativeMatch[];
+  /**
+   * Hamming distance between the two images, out of 64 bits.
+   *
+   * Null when either side has no hash, which the popover must render as "not
+   * compared" rather than as a difference. A failed hash is never a statement
+   * about whether two pictures match.
+   */
+  imageDistance: number | null;
 }
 
 export interface LookupResult {
@@ -60,31 +69,80 @@ export async function lookup(
   thresholds: Thresholds = THRESHOLDS,
   now: number = Date.now(),
 ): Promise<LookupResult> {
+  // The subject's own hash is read from storage rather than passed in. The
+  // content script cannot compute one — hashing a cross-origin image taints the
+  // page's canvas — so by the time a lookup runs, the hash either exists in the
+  // corpus from an earlier pass or does not exist yet.
+  const subjectPhash =
+    subject.phash !== undefined
+      ? subject.phash
+      : ((await source.getMany([subject.mint]))[0]?.phash ?? null);
+
   const [{ coins, capped }, meta] = await Promise.all([
-    source.candidatesFor(subject),
+    source.candidatesFor({ ...subject, phash: subjectPhash }),
     source.meta(),
   ]);
 
-  const matches = matchCorpus(
-    { name: subject.name ?? "", symbol: subject.symbol ?? "", uri: "" },
-    coins.map((coin) => ({
-      mint: coin.mint,
-      name: coin.name ?? "",
-      symbol: coin.symbol ?? "",
-      // Deliberately not the image URL. An identical URL is a usable proxy for
-      // an identical token, but it is not a metadata URI, and routing it
-      // through the metadata shortcut would report `matchedOn: ["metadata"]`
-      // for something that is not that. Images get their own path in phase 4.
-      uri: undefined,
-    })),
-    thresholds.narrative,
-    { excludeMint: subject.mint },
+  const flattened = coins.map((coin) => ({
+    mint: coin.mint,
+    name: coin.name ?? "",
+    symbol: coin.symbol ?? "",
+    // Deliberately not the image URL. An identical URL is a usable proxy for an
+    // identical token, but it is not a metadata URI, and routing it through the
+    // metadata shortcut would report `matchedOn: ["metadata"]` for something
+    // that is not that. Images have their own path, below.
+    uri: undefined,
+  }));
+
+  const subjectText = { name: subject.name ?? "", symbol: subject.symbol ?? "", uri: "" };
+
+  // Scored twice, at two bars, and the second pass is not redundant.
+  //
+  // Text alone has to clear 0.90. Text *corroborating an image match* only has
+  // to clear 0.72 — argus's `vamp_of_runner.min_similarity`, the looser bar it
+  // uses precisely when a phash is also in play. Running one pass at the looser
+  // bar and filtering would not do: `matchedOn` means "what was recognisable",
+  // and at 0.72 that is a weaker claim than at 0.90, so a strict match would
+  // end up reporting a looser recognition than it earned.
+  //
+  // The cost is one extra Jaro-Winkler sweep over at most 200 candidates, which
+  // is nothing beside the IndexedDB reads that fetched them.
+  const strict = new Map(
+    matchCorpus(subjectText, flattened, thresholds.narrative, { excludeMint: subject.mint }).map(
+      (match) => [match.candidate.mint, match],
+    ),
+  );
+  const loose = new Map(
+    matchCorpus(subjectText, flattened, thresholds.narrativeWithImage, {
+      excludeMint: subject.mint,
+    }).map((match) => [match.candidate.mint, match]),
   );
 
-  const byMint = new Map(coins.map((coin) => [coin.mint, coin]));
-  const priors = matches.map((match) =>
-    toPriorRun(byMint.get(match.candidate.mint) as StoredCoin, match, thresholds),
-  );
+  const priors: PriorRun[] = [];
+  for (const coin of coins) {
+    if (coin.mint === subject.mint) continue;
+
+    const distance = hammingDistance(subjectPhash, coin.phash);
+    const imageMatches = distance !== null && distance <= thresholds.phash.maxHamming;
+    const textMatch = strict.get(coin.mint);
+
+    if (textMatch === undefined && !imageMatches) continue;
+
+    const matchedOn: NarrativeMatch[] = [...(textMatch ?? loose.get(coin.mint))?.matchedOn ?? []];
+    if (imageMatches && !matchedOn.includes("image")) matchedOn.push("image");
+
+    // A hash agreeing at distance d out of 64 bits, expressed on the same 0-1
+    // scale as text similarity so the two can be compared and sorted together.
+    // At the 10-bit bar this is 0.84, which is deliberately below a strong text
+    // match: an identical picture is good evidence, not proof of identity.
+    const imageSimilarity = imageMatches ? 1 - (distance as number) / 64 : 0;
+
+    priors.push(
+      toPriorRun(coin, Math.max(textMatch?.similarity ?? 0, imageSimilarity), matchedOn, distance, thresholds),
+    );
+  }
+
+  priors.sort((a, b) => b.similarity - a.similarity || a.mint.localeCompare(b.mint));
 
   return {
     mint: subject.mint,
@@ -97,12 +155,11 @@ export async function lookup(
   };
 }
 
-/** The shape `matchCorpus` was handed: a stored coin flattened for scoring. */
-type ScoredCandidate = { mint: string; name: string; symbol: string; uri?: string | undefined };
-
 function toPriorRun(
   coin: StoredCoin,
-  match: CorpusMatch<ScoredCandidate>,
+  similarity: number,
+  matchedOn: NarrativeMatch[],
+  imageDistance: number | null,
   thresholds: Thresholds,
 ): PriorRun {
   return {
@@ -115,8 +172,9 @@ function toPriorRun(
     peakMcUsd: coin.peakMcUsd,
     ran: coin.ran,
     evidence: ranEvidence(coin, thresholds.ran),
-    similarity: match.similarity,
-    matchedOn: match.matchedOn,
+    similarity,
+    matchedOn,
+    imageDistance,
   };
 }
 
